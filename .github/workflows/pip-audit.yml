@@ -16,10 +16,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           # IMPORTANT: You may need a more specific version here.
           python-version: "3.x"
@@ -34,7 +34,7 @@ jobs:
 
 
       - name: Run pip-audit
-        uses: pypa/gh-action-pip-audit@v1.0.8
+        uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           virtual-environment: /tmp/pip-audit-env
 
