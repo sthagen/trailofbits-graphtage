@@ -83,6 +83,13 @@ class EditDistance(SequenceEdit):
     bound.
 
     """
+
+    __slots__ = (
+        'penalty', 'shared_prefix', 'reversed_shared_suffix', 'from_seq', 'to_seq',
+        'edit_matrix', 'path_costs', 'costs', '_fringe_row', '_fringe_col',
+        '_last_fringe', '_EditDistance__edits'
+    )
+
     def __init__(
             self,
             from_node: TreeNode,
@@ -261,11 +268,11 @@ class EditDistance(SequenceEdit):
                 return ret
 
             if not first_fringe:
-                if DEFAULT_PRINTER.quiet:
-                    fringe_ranges = {}
-                    fringe_total = 0
-                    num_diagonals = 0
-                else:
+                fringe_ranges = {}
+                fringe_total = 0
+                num_diagonals = 0
+
+                if not DEFAULT_PRINTER.quiet:
                     fringe_ranges = {
                         (row, col): (
                             self.edit_matrix[row][col].bounds().upper_bound
