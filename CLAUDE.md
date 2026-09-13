@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Graphtage is a semantic diff/merge utility for tree-like structured data formats (JSON, XML, HTML, YAML, plist, CSS, CSV). It works as both a command-line tool and Python library.
+Graphtage is a semantic diff/merge utility for tree-like structured data formats (JSON, JSON5, XML, HTML, YAML, TOML, INI, CSV, plist, Python pickle). It works as both a command-line tool and Python library.
 
 Key capabilities:
 - Semantic understanding of tree structures (recognizes key vs value changes)
@@ -39,7 +39,7 @@ Key capabilities:
 
 ### File Format Modules
 Each format implements its own TreeNode subclasses and parser:
-- json.py, yaml.py, xml.py, csv.py, plist.py, pickle.py
+- json.py, yaml.py, xml.py, csv.py, toml.py, ini.py, plist.py, pickle.py
 
 ## Development Setup
 
@@ -60,13 +60,11 @@ pytest -q                   # Quiet output
 ```
 
 ### Linting
-```bash
-# Ruff is configured in pyproject.toml
-ruff check graphtage test
-ruff check --fix graphtage test
+Ruff is configured in `pyproject.toml` and gates CI, so the tree is expected to be clean.
 
-# CI currently uses flake8
-flake8 graphtage test --select=E9,F63,F7,F82
+```bash
+ruff check graphtage test docs bindist
+ruff check --fix graphtage test docs bindist
 ```
 
 ### Building Documentation
@@ -78,11 +76,42 @@ cd docs && make html
 ## Code Patterns
 
 ### Adding a New File Format
-1. Create `graphtage/newformat.py`
-2. Define TreeNode subclasses for format-specific structures
-3. Implement a `build_tree(content: str) -> TreeNode` function
-4. Register the filetype in `graphtage/__init__.py`
-5. Add tests in `test/test_newformat.py`
+1. Create `graphtage/newformat.py`.
+2. Define a `Filetype` subclass with a zero-argument `__init__`. `FiletypeWatcher` instantiates it at
+   class-definition time, so it must implement `build_tree`, `build_tree_handling_errors`, and
+   `get_default_formatter`. Registration into `FILETYPES_BY_TYPENAME` and `FILETYPES_BY_MIME` is automatic, and
+   that is what generates the `--from-*`, `--to-*`, and `--format` CLI flags.
+3. Implement `build_tree(path: str, options: Optional[BuildOptions] = None) -> TreeNode`. Reusing
+   `graphtage.json.build_tree` on a plain Python object gets you the whole `TreeNode` contract for free.
+4. Add the module to the `from . import ...` line in `graphtage/__init__.py`. Nothing registers without it, and
+   `docs/build_api.py` discovers API pages from this import.
+5. Add the extension to `register_mimetypes()` in `graphtage/__main__.py`. `mimetypes` does not know most of these,
+   and format detection is extension-based, so without this every diff fails with "Could not determine the filetype".
+6. Add a `test_<typename>_formatting` method to `test/test_formatting.py`, or `test_formatter_coverage` fails. Note
+   that `@filetype_test` only round-trips *unedited* trees, so it cannot catch a formatter that mishandles edits —
+   add a separate diff-level test for insertions and removals.
+7. Give the formatter `print_UnorderedListNode = print_ListNode`, or `test_unordered_list_renders_like_a_list`
+   fails. A formatter that cannot resolve a node type bounces to `self.parent.print(...)` and recurses forever.
+8. Mark helper formatters `is_partial = True` so they stay out of the global `FORMATTERS` list, where they could
+   change how unrelated formats resolve node types.
+9. Update the format lists in `README.md`, `docs/index.rst`, `CITATION.cff`, `pyproject.toml`, the `--help`
+   description in `graphtage/__main__.py`, and this file.
+10. Add a dependency to `pyproject.toml` only if the parser is third-party, and regenerate `uv.lock`.
+
+Route printing through `SequenceFormatter.print_SequenceNode`, which is where insert and remove edits are applied;
+iterating a node's children directly silently drops them. Only one formatter may define `print_<NodeType>` for a
+given type, so distinguish nesting levels in the key/value formatter rather than by node type (see
+`graphtage/yaml.py` and `graphtage/ini.py`).
+
+Python 3.10 is the minimum supported version. Check `requires-python` in `pyproject.toml` and the CI matrix in
+`.github/workflows/pythonpackage.yml` before using a feature from a newer release; a runtime-evaluated annotation
+that the floor does not support fails at import, which takes down the whole package.
+
+Never add `from __future__ import annotations` to this package. Two places read annotations at runtime, and PEP 563
+turns both into silent no-ops rather than errors: `DataClassNode.__init_subclass__` derives `_SLOTS` from
+`cls.__annotations__`, and `FormatterChecker` validates the `printer` parameter of every `print_*` method with
+`inspect.signature`. For the same reason, a `DataClassNode` slot annotation must name a `TreeNode` subclass
+directly; a subscripted generic is skipped, not turned into a slot.
 
 ### Working with Edits
 - Edit costs are computed lazily via `bounds()` method
@@ -98,8 +127,9 @@ The printing system is extensible:
 ## Key Conventions
 
 - Line length: 120 characters (configured in ruff)
-- Python version: 3.8+ compatibility required
-- Type hints: Use typing_extensions for Protocol support
+- Python version: 3.10+ compatibility required; CI covers 3.10 through 3.14
+- Type hints: `typing.Protocol`; `typing_extensions` is not a dependency of the library
+- Annotations: PEP 585 and PEP 604 spellings (`list[str]`, `X | None`), not `typing.List` or `Optional`
 - Docstrings: Google style for public APIs
 - Tests: Mirror package structure in test/ directory
 
@@ -128,3 +158,17 @@ graphtage --html original.json modified.json > diff.html
 - Use `test_*.py` naming convention
 - Tests are organized by module (test_matching.py tests matching.py)
 - Performance tests in timing.py (not run by default)
+
+## Cutting a Release
+
+`graphtage/version.py` is the single source of truth; `pyproject.toml`, `docs/conf.py`, and `bindist/Makefile` all
+derive from it. Three files repeat the version and need a hand edit: `docs/_templates/layout.html` (the documentation
+version picker), `README.md` (the `--version` example), and `CITATION.cff` (`version` and `date-released`).
+
+The order is draft, then tag, then publish. `artifacts.yml` runs on the tag push and uploads the binaries to the draft;
+`pythonpublish.yml` runs on the release being published and uploads to PyPI. Letting the publish create the tag leaves
+the release public with no binaries for as long as they take to build. Both workflows fail if the tag disagrees with
+`graphtage/version.py`.
+
+`docs/releasing.rst` has the full procedure, including the PyPI trusted publisher check that has to happen before
+publishing.

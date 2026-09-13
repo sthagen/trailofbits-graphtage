@@ -1,25 +1,39 @@
 import itertools
 import logging
-import sys
-from abc import abstractmethod, ABC, ABCMeta
+from abc import ABC, ABCMeta, abstractmethod
+from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from functools import wraps
 from typing import (
-    Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Sized, Tuple, Type, TypeVar, Union
+    Any,
+    Optional,
+    Protocol,
+    TypeVar,
+    Union,
+    runtime_checkable,
 )
-from typing_extensions import Protocol, runtime_checkable
 
 from .bounds import Bounded, Range
-from .formatter import Formatter, FORMATTERS
-from .printer import DEFAULT_PRINTER, Printer
+from .formatter import FORMATTERS, Formatter
+from .printer import Printer, get_default_printer
 
 log = logging.getLogger(__name__)
 
 
-if sys.version_info.major == 3 and sys.version_info.minor < 7:
-    # For some reason, the type checker breaks on the generic argument in Py3.6 and earlier
-    FormatterType = Formatter
-else:
-    FormatterType = Formatter[Union['TreeNode', 'Edit']]
+FormatterType = Formatter[Union['TreeNode', 'Edit']]
+
+
+_NODES_BEING_PRINTED: set[int] = set()
+"""The :func:`id` of every node whose formatter is currently on the stack.
+
+:meth:`GraphtageFormatter.print` decides whether to print a node's edit *before* it hands the node to that node's
+formatter, so by the time the formatter runs, the decision has already been made and acted upon. Formatters routinely
+re-enter :meth:`GraphtageFormatter.print` with the very same node to pass it to a sibling formatter, for example
+:meth:`graphtage.json.JSONListFormatter.print_SequenceNode`, which forwards a dict nested in a list to
+:class:`graphtage.json.JSONDictFormatter` through ``self.parent.print(...)``. That re-entry cannot repeat the
+decision: the ``with_edits`` argument is not part of the ``print_*`` calling convention, so it never reaches the
+sub-formatter and the re-entry would default to printing the edit a second time.
+
+"""
 
 
 class GraphtageFormatter(FormatterType):
@@ -31,7 +45,9 @@ class GraphtageFormatter(FormatterType):
         Args:
             printer: The printer to which to write.
             node_or_edit: The node or edit to print.
-            with_edits: If :keyword:True, print any edits associated with the node.
+            with_edits: If :keyword:True, print any edits associated with the node. This is also implied to be
+                :keyword:False while the node's own formatter is on the stack, so that a formatter delegating the
+                same node to a sibling formatter does not print its edit twice.
 
         Note:
             The protocol for determining how a node or edit should be printed is very complex due to its extensibility.
@@ -40,20 +56,20 @@ class GraphtageFormatter(FormatterType):
         """
         if isinstance(node_or_edit, Edit):
             if with_edits:
-                edit: Optional[Edit] = node_or_edit
+                edit: Edit | None = node_or_edit
             else:
-                edit: Optional[Edit] = None
+                edit: Edit | None = None
             node: TreeNode = node_or_edit.from_node
-        elif with_edits:
+        elif with_edits and id(node_or_edit) not in _NODES_BEING_PRINTED:
             if isinstance(node_or_edit, EditedTreeNode) and \
                     node_or_edit.edit is not None and node_or_edit.edit.has_non_zero_cost():
-                edit: Optional[Edit] = node_or_edit.edit
+                edit: Edit | None = node_or_edit.edit
                 node: TreeNode = node_or_edit
             else:
-                edit: Optional[Edit] = None
+                edit: Edit | None = None
                 node: TreeNode = node_or_edit
         else:
-            edit: Optional[Edit] = None
+            edit: Edit | None = None
             node: TreeNode = node_or_edit
         if edit is not None:
             # First, see if we have a specialized formatter for this edit:
@@ -66,27 +82,40 @@ class GraphtageFormatter(FormatterType):
                 return
             except NotImplementedError:
                 pass
-        formatter = self.get_formatter(node)
-        if formatter is not None:
-            formatter(printer, node)
-        else:
-            log.debug(f"""There is no formatter that can handle nodes of type {node.__class__.__name__}
+        self._print_node(printer, node)
+
+    def _print_node(self, printer: Printer, node: 'TreeNode'):
+        """Hands a node to its formatter, suppressing that node's edit for the duration of the call.
+
+        Whether to print ``node``'s edit was already settled by :meth:`GraphtageFormatter.print`, so any re-entrant
+        call for the same node must print the bare node. See :data:`_NODES_BEING_PRINTED`.
+
+        Args:
+            printer: The printer to which to write.
+            node: The node to print.
+
+        """
+        node_id = id(node)
+        is_outermost = node_id not in _NODES_BEING_PRINTED
+        if is_outermost:
+            _NODES_BEING_PRINTED.add(node_id)
+        try:
+            formatter = self.get_formatter(node)
+            if formatter is not None:
+                formatter(printer, node)
+            else:
+                log.debug(f"""There is no formatter that can handle nodes of type {node.__class__.__name__}
     Falling back to the node's internal printer
     Registered formatters: {''.join([f.__class__.__name__ for f in FORMATTERS])}""")
-            node.print(printer)
+                node.print(printer)
+        finally:
+            if is_outermost:
+                _NODES_BEING_PRINTED.discard(node_id)
 
 
 @runtime_checkable
 class Edit(Bounded, Protocol):
-    """A protocol for defining an edit.
-
-    Attributes:
-        initial_bounds (Range): The initial bounds of this edit. Classes implementing this protocol can, for example,
-            set this by calling :meth:`self.bounds()<Edit.bounds>` during initialization.
-
-        from_node (TreeNode): The node that this edit transforms.
-
-    """
+    """A protocol for defining an edit."""
     initial_bounds: Range
     """The initial bounds of this edit.
 
@@ -262,10 +291,10 @@ class EditedTreeNode:
     """
     def __init__(self):
         self.removed: bool = False
-        self.inserted: List[TreeNode] = []
-        self.matched_to: Optional[TreeNode] = None
-        self.edit_list: List[Edit] = []
-        self.edit: Optional[Edit] = None
+        self.inserted: list[TreeNode] = []
+        self.matched_to: TreeNode | None = None
+        self.edit_list: list[Edit] = []
+        self.edit: Edit | None = None
 
     @property
     def edited(self) -> bool:
@@ -297,9 +326,9 @@ class EditedTreeNode:
 class TreeNodeMeta(ABCMeta):
     def __init__(cls, name, *args, **kwargs):
         super().__init__(name, *args, **kwargs)
-        cls._edited_type: Optional[Type[Union[EditedTreeNode, T]]] = None
+        cls._edited_type: type[EditedTreeNode | T] | None = None
 
-    def edited_type(self) -> Type[Union[EditedTreeNode, T]]:
+    def edited_type(self) -> type[EditedTreeNode | T]:
         """Dynamically constructs a new class that is *both* a :class:`TreeNode` *and* an :class:`EditedTreeNode`.
 
         The edited type's member variables are populated by the result of :meth:`TreeNode.editable_dict` of the
@@ -308,7 +337,7 @@ class TreeNodeMeta(ABCMeta):
             new_node.__dict__ = dict(wrapped_tree_node.editable_dict())
 
         Returns:
-            Type[Union[EditedTreeNode, T]]: A class that is *both* a :class:`TreeNode` *and* an :class:`EditedTreeNode`.
+            type[EditedTreeNode | T]: A class that is *both* a :class:`TreeNode` *and* an :class:`EditedTreeNode`.
             Its constructor accepts a :class:`TreeNode` that it will wrap.
 
         """
@@ -344,7 +373,7 @@ class TreeNode(metaclass=TreeNodeMeta):
     """
     _total_size = None
     _parent: Optional["TreeNode"] = None
-    _edit_modifiers: Optional[List[Callable[["TreeNode", "TreeNode"], Optional[Edit]]]] = None
+    _edit_modifiers: list[Callable[["TreeNode", "TreeNode"], Edit | None]] | None = None
 
     @property
     def edited(self) -> bool:
@@ -382,7 +411,7 @@ class TreeNode(metaclass=TreeNodeMeta):
 
     def copy(self: T) -> T:
         """Creates a deep copy of this node"""
-        work: List[Tuple[TreeNode, List[TreeNode], List[TreeNode]]] = [(self, [], list(reversed(self.children())))]
+        work: list[tuple[TreeNode, list[TreeNode], list[TreeNode]]] = [(self, [], list(reversed(self.children())))]
         while work:
             node, processed_children, remaining_children = work.pop()
             if not remaining_children:
@@ -478,13 +507,13 @@ class TreeNode(metaclass=TreeNodeMeta):
         """
         raise NotImplementedError()
 
-    def add_edit_modifier(self, modifier: Callable[["TreeNode", "TreeNode"], Optional[Edit]]):
+    def add_edit_modifier(self, modifier: Callable[["TreeNode", "TreeNode"], Edit | None]):
         if self._edit_modifiers is None:
             self._edit_modifiers = []
             self.edits = self._edits_with_modifiers
         self._edit_modifiers.append(modifier)
 
-    def make_edited(self) -> Union[EditedTreeNode, T]:
+    def make_edited(self) -> EditedTreeNode | T:
         """Returns a new, copied instance of this node that is also an instance of :class:`EditedTreeNode`.
 
         This is equivalent to::
@@ -492,7 +521,7 @@ class TreeNode(metaclass=TreeNodeMeta):
             return self.__class__.edited_type()(self)
 
         Returns:
-            Union[EditedTreeNode, T]: A copied version of this node that is also an instance of :class:`EditedTreeNode`
+            EditedTreeNode | T: A copied version of this node that is also an instance of :class:`EditedTreeNode`
             and thereby mutable.
 
         """
@@ -503,7 +532,7 @@ class TreeNode(metaclass=TreeNodeMeta):
         assert isinstance(ret, EditedTreeNode)
         return ret
 
-    def editable_dict(self) -> Dict[str, Any]:
+    def editable_dict(self) -> dict[str, Any]:
         """Copies :obj:`self.__dict__`, calling :meth:`TreeNode.editable_dict` on any :class:`TreeNode` objects therein.
 
         This is equivalent to::
@@ -526,7 +555,7 @@ class TreeNode(metaclass=TreeNodeMeta):
                     ret[key] = value.make_edited()
         return ret
 
-    def get_all_edit_contexts(self, node: "TreeNode") -> Iterator[Tuple[Tuple["TreeNode", ...], Edit]]:
+    def get_all_edit_contexts(self, node: "TreeNode") -> Iterator[tuple[tuple["TreeNode", ...], Edit]]:
         """Returns an iterator over all edit contexts that will transform this node into the provided node.
 
         Args:
@@ -542,18 +571,18 @@ class TreeNode(metaclass=TreeNodeMeta):
         prev_bounds = edit.bounds()
         total_range = prev_bounds.upper_bound - prev_bounds.lower_bound
         prev_range = total_range
-        with DEFAULT_PRINTER.tqdm(leave=False, initial=0, total=total_range, desc='Diffing') as t:
+        with get_default_printer().tqdm(leave=False, initial=0, total=total_range, desc='Diffing') as t:
             while edit.valid and not edit.is_complete() and edit.tighten_bounds():
                 new_bounds = edit.bounds()
                 new_range = new_bounds.upper_bound - new_bounds.lower_bound
                 t.update(prev_range - new_range)
                 prev_range = new_range
-        edit_stack: List[Tuple[Tuple[TreeNode, ...], Edit]] = [((node,), edit)]
+        edit_stack: list[tuple[tuple[TreeNode, ...], Edit]] = [((node,), edit)]
         while edit_stack:
             ancestors, edit = edit_stack.pop()
             if isinstance(edit, CompoundEdit):
                 for sub_edit in reversed(list(edit.edits())):
-                    edit_stack.append((ancestors + (sub_edit.from_node,), sub_edit))
+                    edit_stack.append(((*ancestors, sub_edit.from_node), sub_edit))
             else:
                 while edit.bounds().lower_bound == 0 and not edit.bounds().definitive() and edit.tighten_bounds():
                     pass
@@ -574,14 +603,14 @@ class TreeNode(metaclass=TreeNodeMeta):
         for _, edit in self.get_all_edit_contexts(node):
             yield edit
 
-    def diff(self: T, node: 'TreeNode') -> Union[EditedTreeNode, T]:
+    def diff(self: T, node: 'TreeNode') -> EditedTreeNode | T:
         """Performs a diff against the provided node.
 
         Args:
             node: The node against which to perform the diff.
 
         Returns:
-            Union[EditedTreeNode, T]: An edited version of this node with all edits being
+            EditedTreeNode | T: An edited version of this node with all edits being
             :meth:`completed <Edit.is_complete>`.
 
         """
@@ -592,7 +621,7 @@ class TreeNode(metaclass=TreeNodeMeta):
         prev_bounds = edit.bounds()
         total_range = prev_bounds.upper_bound - prev_bounds.lower_bound
         prev_range = total_range
-        with DEFAULT_PRINTER.tqdm(leave=False, initial=0, total=total_range, desc='Diffing') as t:
+        with get_default_printer().tqdm(leave=False, initial=0, total=total_range, desc='Diffing') as t:
             while edit.valid and not edit.is_complete() and edit.tighten_bounds():
                 new_bounds = edit.bounds()
                 new_range = new_bounds.upper_bound - new_bounds.lower_bound
@@ -661,14 +690,14 @@ class ContainerNode(TreeNode, Sized, ABC):
         super().__init_subclass__(**kwargs)
         # wrap the subclass's __init__ function to auto-set the parents of its children
         if "__init__" in cls.__dict__ and cls.__init__ is not object.__init__:
-            orig_init = getattr(cls, "__init__")
+            orig_init = cls.__init__
 
             @wraps(orig_init)
             def wrapped(self: ContainerNode, *args, **kw):
                 if hasattr(self, "_container_initializing") and self._container_initializing:
                     first_init = False
                 else:
-                    setattr(self, "_container_initializing", True)
+                    self._container_initializing = True
                     first_init = True
                 ret = orig_init(self, *args, **kw)
                 if first_init:

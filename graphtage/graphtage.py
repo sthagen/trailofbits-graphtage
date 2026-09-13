@@ -1,20 +1,20 @@
 __docformat__ = "google"
 
-import mimetypes
-from abc import ABC, ABCMeta, abstractmethod
 import copy as copy_module
-from typing import Any, Collection, Dict, Generic, Iterable, Iterator, List, Optional, Tuple, Type, TypeVar, Union
+import mimetypes
+import warnings
+from abc import ABC, ABCMeta, abstractmethod
+from collections.abc import Collection, Iterable, Iterator
+from typing import Any, Generic, TypeVar
 
 from .bounds import Range
-from .edits import AbstractEdit, EditCollection
-from .edits import Insert, Match, Remove, Replace, AbstractCompoundEdit
+from .edits import AbstractCompoundEdit, AbstractEdit, EditCollection, Insert, Match, Remove, Replace
 from .levenshtein import EditDistance, levenshtein_distance
 from .multiset import MultiSetEdit
-from .printer import Back, Fore, NullANSIContext, NULL_PRINTER, Printer
+from .printer import NULL_PRINTER, Back, Fore, NullANSIContext, Printer
 from .sequences import FixedLengthSequenceEdit, SequenceEdit, SequenceNode
 from .tree import ContainerNode, Edit, GraphtageFormatter, TreeNode
 from .utils import HashableCounter
-
 
 C = TypeVar("C", bound=TreeNode)
 T = TypeVar("T", bound=TreeNode)
@@ -207,19 +207,17 @@ class KeyValuePairNode(ContainerNode):
         with printer.color(Fore.BLUE):
             printer.write("]")
 
-    def editable_dict(self) -> Dict[str, Any]:
+    def editable_dict(self) -> dict[str, Any]:
         ret = dict(self.__dict__)
         ret["key"] = self.key.make_edited()
         ret["value"] = self.value.make_edited()
         return ret
 
-    def children(self) -> Tuple[LeafNode, TreeNode]:
+    def children(self) -> tuple[LeafNode, TreeNode]:
         return self.key, self.value
 
     def edits(self, node: TreeNode) -> Edit:
-        if not isinstance(node, KeyValuePairNode):
-            raise RuntimeError("KeyValuePairNode.edits() should only ever be called with another KeyValuePair object!")
-        if self.allow_key_edits or self.key == node.key:
+        if isinstance(node, KeyValuePairNode) and (self.allow_key_edits or self.key == node.key):
             return KeyValuePairEdit(self, node)
         else:
             return Replace(self, node)
@@ -299,7 +297,7 @@ class KeyValuePairNode(ContainerNode):
         return f"{self.key!s}: {self.value!s}"
 
 
-class ListNode(SequenceNode[Tuple[T, ...]], Generic[T]):
+class ListNode(SequenceNode[tuple[T, ...]], Generic[T]):
     """A node containing an ordered sequence of nodes."""
 
     def __init__(
@@ -326,7 +324,7 @@ class ListNode(SequenceNode[Tuple[T, ...]], Generic[T]):
         return [n.to_obj() for n in self]
 
     @property
-    def container_type(self) -> Type[Tuple[T, ...]]:
+    def container_type(self) -> type[tuple[T, ...]]:
         """The container type required by :class:`graphtage.sequences.SequenceNode`
 
         Returns:
@@ -378,7 +376,7 @@ class MultiSetNode(SequenceNode[HashableCounter[T]], Generic[T]):
         return HashableCounter(n.to_obj() for n in self)
 
     @property
-    def container_type(self) -> Type[HashableCounter[T]]:
+    def container_type(self) -> type[HashableCounter[T]]:
         return HashableCounter
 
     def edits(self, node: TreeNode) -> Edit:
@@ -405,6 +403,33 @@ class MultiSetNode(SequenceNode[HashableCounter[T]], Generic[T]):
         return f"{self.__class__.__name__}({list(self)!r})"
 
 
+class UnorderedListNode(MultiSetNode[T], Generic[T]):
+    """A list whose elements are matched as an unordered collection.
+
+    This is the node type that :attr:`BuildOptions.ignore_list_order` builds in place of :class:`ListNode`. It keeps
+    the rendering of a list in every output format while inheriting the matching semantics of :class:`MultiSetNode`,
+    so reordering a list costs nothing. Duplicate elements still count: ``[1, 1, 2]`` matches ``[2, 1, 1]`` for free,
+    but not ``[1, 2, 2]``.
+
+    """
+
+    def to_obj(self):
+        return [n.to_obj() for n in self]
+
+    def edits(self, node: TreeNode) -> Edit:
+        if isinstance(node, MappingNode):
+            return Replace(self, node)
+        elif isinstance(node, MultiSetNode):
+            return super().edits(node)
+        elif isinstance(node, ListNode):
+            other = HashableCounter(node._children)
+            if self._children == other:
+                return Match(self, node, 0)
+            return MultiSetEdit(self, node, self._children, other, auto_match_keys=self.auto_match_keys)
+        else:
+            return Replace(self, node)
+
+
 class MappingNode(ContainerNode, ABC):
     """An abstract base class for nodes that represent mappings."""
 
@@ -414,7 +439,7 @@ class MappingNode(ContainerNode, ABC):
 
     @classmethod
     @abstractmethod
-    def from_dict(cls: Type[T], source_dict: Dict[LeafNode, TreeNode]) -> T:
+    def from_dict(cls: type[T], source_dict: dict[LeafNode, TreeNode]) -> T:
         """Constructs a :class:`MappingNode` from a mapping of :class:`LeafNode` to :class:`TreeNode`.
 
         Args:
@@ -426,7 +451,7 @@ class MappingNode(ContainerNode, ABC):
         """
         raise NotImplementedError()
 
-    def to_obj(self) -> Dict[Any, Any]:
+    def to_obj(self) -> dict[Any, Any]:
         return {
             k.to_obj(): v.to_obj() for k, v in self.items()
         }
@@ -435,7 +460,7 @@ class MappingNode(ContainerNode, ABC):
         # this is handled by KeyValuePairNode
         pass
 
-    def items(self) -> Iterator[Tuple[TreeNode, TreeNode]]:
+    def items(self) -> Iterator[tuple[TreeNode, TreeNode]]:
         """Iterates over the key/value pairs in this mapping, similar to :meth:`dict.items`.
 
         The implementation is equivalent to::
@@ -511,7 +536,7 @@ class DictNode(MappingNode, MultiSetNode[KeyValuePairNode]):
     """
 
     @classmethod
-    def from_dict(cls: Type[T], source_dict: Dict[LeafNode, TreeNode]) -> T:
+    def from_dict(cls: type[T], source_dict: dict[LeafNode, TreeNode]) -> T:
         """Constructs a :class:`DictNode` from a mapping of :class:`LeafNode` to :class:`TreeNode`.
 
         Args:
@@ -526,7 +551,7 @@ class DictNode(MappingNode, MultiSetNode[KeyValuePairNode]):
         )
 
     def edits(self, node: TreeNode) -> Edit:
-        if isinstance(node, MultiSetNode):
+        if isinstance(node, MultiSetNode) and not isinstance(node, UnorderedListNode):
             return super().edits(node)
         else:
             return Replace(self, node)
@@ -535,7 +560,7 @@ class DictNode(MappingNode, MultiSetNode[KeyValuePairNode]):
         yield from self._children.elements()
 
 
-class FixedKeyDictNodeEdit(SequenceEdit, EditCollection[List]):
+class FixedKeyDictNodeEdit(SequenceEdit, EditCollection[list]):
     """The edit type returned by :class:`FixedKeyDictNode`."""
 
     __slots__ = ()
@@ -556,7 +581,7 @@ class FixedKeyDictNodeEdit(SequenceEdit, EditCollection[List]):
         )
 
 
-class FixedKeyDictNode(MappingNode, SequenceNode[Dict[LeafNode, KeyValuePairNode]]):
+class FixedKeyDictNode(MappingNode, SequenceNode[dict[LeafNode, KeyValuePairNode]]):
     """A dictionary that only attempts to match two :class:`KeyValuePairNode` objects if they share the same key.
 
     This is the most efficient dictionary matching node type, and is what is used with the
@@ -566,7 +591,7 @@ class FixedKeyDictNode(MappingNode, SequenceNode[Dict[LeafNode, KeyValuePairNode
         This implementation does not currently support duplicate keys.
     """
     @property
-    def container_type(self) -> Type[Dict[LeafNode, KeyValuePairNode]]:
+    def container_type(self) -> type[dict[LeafNode, KeyValuePairNode]]:
         """The container type required by :class:`graphtage.sequences.SequenceNode`
 
         Returns:
@@ -576,7 +601,7 @@ class FixedKeyDictNode(MappingNode, SequenceNode[Dict[LeafNode, KeyValuePairNode
         return dict
 
     @classmethod
-    def from_dict(cls: Type[T], source_dict: Dict[LeafNode, TreeNode]) -> T:
+    def from_dict(cls: type[T], source_dict: dict[LeafNode, TreeNode]) -> T:
         """Constructs a :class:`FixedKeyDictNode` from a mapping of :class:`LeafNode` to :class:`TreeNode`.
 
         Args:
@@ -632,10 +657,10 @@ class FixedKeyDictNode(MappingNode, SequenceNode[Dict[LeafNode, KeyValuePairNode
         else:
             return Replace(self, node)
 
-    def items(self) -> Iterator[Tuple[LeafNode, TreeNode]]:
+    def items(self) -> Iterator[tuple[LeafNode, TreeNode]]:
         yield from iter(self._children.items())
 
-    def editable_dict(self) -> Dict[str, Any]:
+    def editable_dict(self) -> dict[str, Any]:
         ret = dict(self.__dict__)
         ret["_children"] = {e.key: e for e in (kvp.make_edited() for kvp in self)}
         return ret
@@ -723,7 +748,7 @@ class StringFormatter(GraphtageFormatter):
             return c
 
     def write_char(
-            self, printer: Printer, c: Union[str, int], index: int, num_edits: int, removed=False, inserted=False
+            self, printer: Printer, c: str | int, index: int, num_edits: int, removed=False, inserted=False
     ):
         """Writes a character to the printer.
 
@@ -824,17 +849,15 @@ class StringFormatter(GraphtageFormatter):
                     remove_seq.append(to_remove)
                     add_seq.append(to_add)
                 else:
-                    with printer.color(Fore.WHITE).background(Back.RED).bright():
-                        with printer.strike():
-                            for rm in remove_seq:
-                                self.write_char(p, rm, index, num_edits, removed=True)
-                                index += 1
+                    with printer.color(Fore.WHITE).background(Back.RED).bright(), printer.strike():
+                        for rm in remove_seq:
+                            self.write_char(p, rm, index, num_edits, removed=True)
+                            index += 1
                     remove_seq = []
-                    with printer.color(Fore.WHITE).background(Back.GREEN).bright():
-                        with printer.under_plus():
-                            for add in add_seq:
-                                self.write_char(p, add, index, num_edits, inserted=True)
-                                index += 1
+                    with printer.color(Fore.WHITE).background(Back.GREEN).bright(), printer.under_plus():
+                        for add in add_seq:
+                            self.write_char(p, add, index, num_edits, inserted=True)
+                            index += 1
                     add_seq = []
                     if to_remove is not None:
                         remove_seq.append(to_remove)
@@ -843,16 +866,14 @@ class StringFormatter(GraphtageFormatter):
                     if matched is not None:
                         self.write_char(p, matched, index, num_edits)
                         index += 1
-            with printer.color(Fore.WHITE).background(Back.RED).bright():
-                with printer.strike():
-                    for j, rm in enumerate(remove_seq):
-                        self.write_char(p, rm, index, num_edits, removed=True)
-                        index += 1
-            with printer.color(Fore.WHITE).background(Back.GREEN).bright():
-                with printer.under_plus():
-                    for add in add_seq:
-                        self.write_char(p, add, index, num_edits, inserted=True)
-                        index += 1
+            with printer.color(Fore.WHITE).background(Back.RED).bright(), printer.strike():
+                for rm in remove_seq:
+                    self.write_char(p, rm, index, num_edits, removed=True)
+                    index += 1
+            with printer.color(Fore.WHITE).background(Back.GREEN).bright(), printer.under_plus():
+                for add in add_seq:
+                    self.write_char(p, add, index, num_edits, inserted=True)
+                    index += 1
             if self._last_was_inserted:
                 printer.write(Insert.INSERT_STRING)
                 self._last_was_inserted = False
@@ -865,7 +886,7 @@ class StringFormatter(GraphtageFormatter):
 class StringNode(LeafNode):
     """A node containing a string"""
 
-    def __init__(self, string_like: Union[str, bytes], quoted=True):
+    def __init__(self, string_like: str | bytes, quoted=True):
         """Initializes a string node.
 
         Args:
@@ -930,10 +951,7 @@ class NullNode(LeafNode):
             return Replace(self, node)
 
     def __lt__(self, other):
-        if isinstance(other, NullNode):
-            return False
-        else:
-            return True
+        return not isinstance(other, NullNode)
 
     def __eq__(self, other):
         return isinstance(other, NullNode)
@@ -967,8 +985,8 @@ def string_edit_distance(s1: str, s2: str) -> EditDistance:
     return EditDistance(list1, list2, list1.children(), list2.children(), insert_remove_penalty=0)
 
 
-FILETYPES_BY_MIME: Dict[str, 'Filetype'] = {}
-FILETYPES_BY_TYPENAME: Dict[str, 'Filetype'] = {}
+FILETYPES_BY_MIME: dict[str, 'Filetype'] = {}
+FILETYPES_BY_TYPENAME: dict[str, 'Filetype'] = {}
 
 
 class FiletypeWatcher(ABCMeta):
@@ -984,7 +1002,7 @@ class FiletypeWatcher(ABCMeta):
             instance = cls()
             assert instance.name in FILETYPES_BY_TYPENAME
             assert instance.default_mimetype in FILETYPES_BY_MIME
-            setattr(cls, "default_instance", instance)
+            cls.default_instance = instance
         super().__init__(name, bases, clsdict)
 
 
@@ -996,7 +1014,8 @@ class BuildOptions:
                  auto_match_keys=True,
                  allow_list_edits=True,
                  allow_list_edits_when_same_length=True,
-                 check_for_cyces=True,
+                 ignore_list_order=False,
+                 check_for_cycles: bool | None = None,
                  ignore_cycles=False,
                  printer=NULL_PRINTER,
                  **kwargs
@@ -1005,29 +1024,88 @@ class BuildOptions:
 
         Options not specified will default to :const:`False`.
 
+        Args:
+            check_for_cycles: Whether to check the input for cycles. Omitting it, or passing :const:`None`,
+                selects the default of :const:`True`. The misspelled ``check_for_cyces`` is still accepted as a
+                deprecated alias and raises a :class:`DeprecationWarning`.
+
+        Raises:
+            TypeError: If both ``check_for_cycles`` and the deprecated ``check_for_cyces`` alias are given.
+
         """
+        check_for_cycles = self._resolve_check_for_cycles(check_for_cycles, kwargs)
         self.allow_key_edits = allow_key_edits
         """Whether to consider editing keys when matching :class:`KeyValuePairNode` objects"""
         self.allow_list_edits = allow_list_edits
         """Whether to consider insert and remove edits to lists"""
         self.allow_list_edits_when_same_length = allow_list_edits_when_same_length
         """Whether to consider insert and remove edits on lists that are the same length"""
+        self.ignore_list_order = ignore_list_order
+        """Whether to match the elements of a list as an unordered collection
+
+        With this set, reordering a list costs nothing, because lists are built as
+        :class:`UnorderedListNode` instead of :class:`ListNode`. Duplicate elements still count, so ``[1, 1, 2]``
+        matches ``[2, 1, 1]`` but not ``[1, 2, 2]``.
+
+        Two lists whose elements are all equal match immediately, however long they are: a shuffle of 2000 integers
+        takes about 0.01 seconds. Matching two lists that differ is a bipartite matching over their symmetric
+        difference, which grows much faster than the ordered comparison: 30 dictionaries of which none match took
+        about 30 seconds in one measurement, against 0.7 seconds by default.
+
+        This applies to every format that builds its lists through :func:`graphtage.json.build_tree`, which is all
+        of them except the rows of a CSV file and the children of an XML element.
+
+        """
         self.auto_match_keys = auto_match_keys
         """Whether to automatically match key/value pairs in dictionaries if they share the same key"""
-        self.check_for_cycles = check_for_cyces
+        self.check_for_cycles = check_for_cycles
         """If possible, check for cycles in the input
-        
+
         If `True` and if `ignore_cycles` is `False`, then a :class:`ValueError` will be raised if a cycle is detected
         while constructing the Graphtage tree.
-        
+
         """
         self.ignore_cycles = ignore_cycles
         """If `True` and if `check_for_cycles` is also `True`, then ignore cycles in the input,
         preventing an infinite loop."""
         self.printer = printer
-        """A printer to use while building trees (default is :class:`graphtage.printer.NullPrinter`)"""
+        """A printer to use while building trees (default is :attr:`graphtage.printer.NULL_PRINTER`)"""
         for attr, value in kwargs.items():
             setattr(self, attr, value)
+
+    @staticmethod
+    def _resolve_check_for_cycles(check_for_cycles: bool | None, kwargs: dict[str, Any]) -> bool:
+        """Resolves the ``check_for_cycles`` option, honoring its deprecated misspelling.
+
+        The alias is removed from ``kwargs`` so that it is not also set as an attribute by the catch-all that
+        assigns every unrecognized keyword.
+
+        Args:
+            check_for_cycles: The value given for the correctly spelled keyword, or :const:`None` if it was omitted.
+            kwargs: The unrecognized keyword arguments, modified in place.
+
+        Returns:
+            bool: The value to assign to :attr:`BuildOptions.check_for_cycles`.
+
+        Raises:
+            TypeError: If both spellings were given.
+
+        """
+        deprecated = kwargs.pop("check_for_cyces", None)
+        if deprecated is not None:
+            warnings.warn(
+                "The `check_for_cyces` keyword argument of BuildOptions is misspelled and deprecated; "
+                "use `check_for_cycles` instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if check_for_cycles is not None:
+                raise TypeError(
+                    "BuildOptions got both `check_for_cycles` and its deprecated alias `check_for_cyces`; "
+                    "pass only `check_for_cycles`"
+                )
+            check_for_cycles = deprecated
+        return True if check_for_cycles is None else check_for_cycles
 
     def copy(self) -> "BuildOptions":
         return copy_module.copy(self)
@@ -1063,7 +1141,7 @@ class Filetype(metaclass=FiletypeWatcher):
         """
         self.name = type_name
         self.default_mimetype: str = default_mimetype
-        self.mimetypes: Tuple[str, ...] = (default_mimetype,) + tuple(mimetypes)
+        self.mimetypes: tuple[str, ...] = (default_mimetype, *mimetypes)
         for mime_type in self.mimetypes:
             if mime_type in FILETYPES_BY_MIME:
                 raise ValueError(f"MIME type {mime_type} is already assigned to {FILETYPES_BY_MIME[mime_type]}")
@@ -1075,7 +1153,7 @@ class Filetype(metaclass=FiletypeWatcher):
         FILETYPES_BY_TYPENAME[self.name] = self
 
     @abstractmethod
-    def build_tree(self, path: str, options: Optional[BuildOptions] = None) -> TreeNode:
+    def build_tree(self, path: str, options: BuildOptions | None = None) -> TreeNode:
         """Builds an intermediate representation tree from a file of this :class:`Filetype`.
 
         Args:
@@ -1089,7 +1167,7 @@ class Filetype(metaclass=FiletypeWatcher):
         raise NotImplementedError()
 
     @abstractmethod
-    def build_tree_handling_errors(self, path: str, options: Optional[BuildOptions] = None) -> Union[str, TreeNode]:
+    def build_tree_handling_errors(self, path: str, options: BuildOptions | None = None) -> str | TreeNode:
         """Same as :meth:`Filetype.build_tree`, but it should return a human-readable error string on failure.
 
         This function should never throw an exception.
@@ -1099,7 +1177,7 @@ class Filetype(metaclass=FiletypeWatcher):
             options: An optional set of options for building the tree
 
         Returns:
-            Union[str, TreeNode]: On success, the root tree node, or a string containing the error message on failure.
+            str | TreeNode: On success, the root tree node, or a string containing the error message on failure.
 
         """
         raise NotImplementedError()
@@ -1110,7 +1188,7 @@ class Filetype(metaclass=FiletypeWatcher):
         raise NotImplementedError()
 
 
-def get_filetype(path: Optional[str] = None, mime_type: Optional[str] = None) -> Filetype:
+def get_filetype(path: str | None = None, mime_type: str | None = None) -> Filetype:
     """Looks up the filetype for the given path.
 
     At least one of :obj:`path` or :obj:`mime_type` must be not :const:`None`. If both are provided, only

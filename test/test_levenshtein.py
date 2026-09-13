@@ -1,14 +1,14 @@
 import random
-from typing import List
 from unittest import TestCase
 
 from tqdm import trange
 
-from graphtage.edits import Edit, Insert, Match, Remove
 from graphtage import EditDistance, string_edit_distance
-
+from graphtage.edits import Edit, Insert, Match, Remove
+from graphtage.levenshtein import levenshtein_distance
 
 LETTERS: str = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+SMALL_ALPHABET: str = 'abcd'
 
 
 class TestEditDistance(TestCase):
@@ -19,7 +19,7 @@ class TestEditDistance(TestCase):
             str_from = ''.join(random.choices(LETTERS, k=str1_len))
             str_to = ''.join(random.choices(LETTERS, k=str2_len))
             distance: EditDistance = string_edit_distance(str_from, str_to)
-            edits: List[Edit] = list(distance.edits())
+            edits: list[Edit] = list(distance.edits())
             reconstructed_from = ''
             reconstructed_to = ''
             for edit in edits:
@@ -53,13 +53,35 @@ class TestEditDistance(TestCase):
                 else:
                     str_to += str_from[i]
             distance: EditDistance = string_edit_distance(str_from, str_to)
-            edits: List[Edit] = list(distance.edits())
+            edits: list[Edit] = list(distance.edits())
             num_edits = len(edits)
             if num_ground_truth_edits < num_edits:
                 print()
                 print('\n'.join([e.__class__.__name__ for e in edits]))
                 print(str_from, str_to)
             self.assertGreaterEqual(num_ground_truth_edits, num_edits)
+
+    def test_string_edit_distance_is_levenshtein(self):
+        """Cross-checks the edit matrix against the canonical Levenshtein implementation.
+
+        A small alphabet and short strings are used deliberately: they maximize the number of cells in
+        which a substitution ties with an insertion paired with a removal, which is the case that
+        https://github.com/trailofbits/graphtage/issues/89 got wrong.
+
+        """
+        for _ in trange(200):
+            str_from = ''.join(random.choices(SMALL_ALPHABET, k=random.randint(0, 10)))
+            str_to = ''.join(random.choices(SMALL_ALPHABET, k=random.randint(0, 10)))
+            distance: EditDistance = string_edit_distance(str_from, str_to)
+            while distance.tighten_bounds():
+                pass
+            bounds = distance.bounds()
+            self.assertTrue(bounds.definitive(), f"{str_from!r} -> {str_to!r} has bounds {bounds!s}")
+            self.assertEqual(
+                levenshtein_distance(str_from, str_to),
+                bounds.upper_bound,
+                f"{str_from!r} -> {str_to!r}"
+            )
 
     def test_empty_string_edit_distance(self):
         with self.assertRaises(StopIteration):

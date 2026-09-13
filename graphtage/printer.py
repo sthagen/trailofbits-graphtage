@@ -9,25 +9,23 @@ There are several reasons for using this abstraction when printing in Graphtage:
    the command line).
 
 Attributes:
-    DEFAULT_PRINTER (Printer): A default :class:`Printer` instance printing to :attr:`sys.stdout`.
+    DEFAULT_PRINTER (Printer): A default :class:`Printer` instance printing to :attr:`sys.stdout`. Read it through
+        :func:`get_default_printer` rather than importing the name, because :func:`set_default_printer` replaces it.
+
+    NULL_PRINTER (Printer): A :class:`Printer` instance that discards everything written to it.
 
 """
 
 import logging
-import os
 import sys
 from abc import abstractmethod
 from collections import defaultdict
 from functools import wraps
-from typing import Any, Dict, List, Optional, Set, Type, Union
-if sys.version_info[0] < 3 or sys.version_info[1] < 7:
-    Protocol = object
-else:
-    from typing_extensions import Protocol
+from typing import Any, Optional, Protocol, Union
 
 import colorama
 from colorama import Back, Fore, Style
-from colorama.ansi import AnsiFore, AnsiBack, AnsiStyle
+from colorama.ansi import AnsiBack, AnsiFore, AnsiStyle
 
 from .progress import StatusWriter
 from .version import VERSION_STRING
@@ -87,7 +85,7 @@ class CombiningMarkWriter(RawWriter):
         """
         self.parent: RawWriter = parent
         """This writer's parent."""
-        self._marks: Set[str] = set()
+        self._marks: set[str] = set()
         self.enabled: bool = True
         """Whether or not combining marks will be added."""
 
@@ -104,7 +102,7 @@ class CombiningMarkWriter(RawWriter):
         return CombiningMarkContext(self, *combining_marks)
 
     @property
-    def marks(self) -> Set[str]:
+    def marks(self) -> set[str]:
         """Returns the set of combining marks in this writer."""
         return self._marks
 
@@ -146,8 +144,8 @@ class CombiningMarkContext:
     """A context returned by :meth:`CombiningMarkWriter.context`."""
     def __init__(self, writer: CombiningMarkWriter, *combining_marks: str):
         self.writer: CombiningMarkWriter = writer
-        self.marks: Set[str] = set(combining_marks)
-        self._state_before: Optional[Set[str]] = None
+        self.marks: set[str] = set(combining_marks)
+        self._state_before: set[str] | None = None
 
     def __enter__(self) -> CombiningMarkWriter:
         self._state_before = set(self.writer.marks)
@@ -166,9 +164,9 @@ class ANSIContext:
     def __init__(
             self,
             stream: Union[RawWriter, 'ANSIContext'],
-            fore: Optional[AnsiFore] = None,
-            back: Optional[AnsiBack] = None,
-            style: Optional[AnsiStyle] = None,
+            fore: AnsiFore | None = None,
+            back: AnsiBack | None = None,
+            style: AnsiStyle | None = None,
     ):
         """Initializes a context.
 
@@ -183,15 +181,15 @@ class ANSIContext:
         """
         if isinstance(stream, ANSIContext):
             self.stream: RawWriter = stream.stream
-            self._parent: Optional['ANSIContext'] = stream
+            self._parent: ANSIContext | None = stream
         else:
             self.stream: RawWriter = stream
-            self._parent: Optional['ANSIContext'] = None
-        self._fore: Optional[AnsiFore] = fore
-        self._back: Optional[AnsiBack] = back
-        self._style: Optional[AnsiStyle] = style
-        self._start_code: Optional[str] = None
-        self._end_code: Optional[str] = None
+            self._parent: ANSIContext | None = None
+        self._fore: AnsiFore | None = fore
+        self._back: AnsiBack | None = back
+        self._style: AnsiStyle | None = style
+        self._start_code: str | None = None
+        self._end_code: str | None = None
         self.is_applied: bool = False
         """Keeps track of whether this context's options have already been applied to the underlying stream."""
 
@@ -219,7 +217,7 @@ class ANSIContext:
         contexts = ANSI_CONTEXT_STACK[self.stream]
         if contexts:
             if self._parent is None:
-                self._parent: Optional['ANSIContext'] = contexts[-1]
+                self._parent: ANSIContext | None = contexts[-1]
             else:
                 if not self.root.is_applied:
                     self.root._parent = contexts[-1]
@@ -252,7 +250,7 @@ class ANSIContext:
         self._end_code += parent_end_code
 
     @property
-    def fore(self) -> Optional[AnsiFore]:
+    def fore(self) -> AnsiFore | None:
         """The computed foreground color of this context."""
         if self._fore is None and self._parent is not None:
             return self._parent.fore
@@ -260,7 +258,7 @@ class ANSIContext:
             return self._fore
 
     @property
-    def back(self) -> Optional[AnsiBack]:
+    def back(self) -> AnsiBack | None:
         """The computed background color of this context."""
         if self._back is None and self._parent is not None:
             return self._parent.back
@@ -268,7 +266,7 @@ class ANSIContext:
             return self._back
 
     @property
-    def style(self) -> Optional[AnsiStyle]:
+    def style(self) -> AnsiStyle | None:
         """The computed style of this context."""
         if self._style is None and self._parent is not None:
             return self._parent.style
@@ -363,7 +361,7 @@ class HTMLANSIContext(ANSIContext):
         contexts = ANSI_CONTEXT_STACK[self.stream]
         if contexts:
             if self._parent is None:
-                self._parent: Optional['ANSIContext'] = contexts[-1]
+                self._parent: ANSIContext | None = contexts[-1]
             else:
                 if not self.root.is_applied:
                     self.root._parent = contexts[-1]
@@ -380,11 +378,11 @@ class HTMLANSIContext(ANSIContext):
             style += f"background-color: {self.get_back(self._back)};"
         if self._style is not None and (self._parent is None or self._style != self.parent.style):
             if self._style == Style.BRIGHT:
-                style += f"font-weight: bold; opacity: 1.0;"
+                style += "font-weight: bold; opacity: 1.0;"
             elif self._style == Style.DIM:
-                style += f"opacity: 0.6; font-weight: normal;"
+                style += "opacity: 0.6; font-weight: normal;"
             else:
-                style += f"font-weight: normal; opacity: 1.0;"
+                style += "font-weight: normal; opacity: 1.0;"
 
         if style:
             self._start_code = f'{self._start_code}<span style="{style}">'
@@ -395,7 +393,7 @@ class HTMLANSIContext(ANSIContext):
         self._end_code = f"{self._end_code}{parent_end_code}"
 
 
-ONLY_ANSI_FUNCS: Set[str] = set()
+ONLY_ANSI_FUNCS: set[str] = set()
 
 
 def only_ansi(func):
@@ -439,7 +437,25 @@ class NullANSIContext:
         return getattr(self._printer, item)
 
 
-ANSI_CONTEXT_STACK: Dict[Writer, List[ANSIContext]] = defaultdict(list)
+ANSI_CONTEXT_STACK: dict[Writer, list[ANSIContext]] = defaultdict(list)
+
+
+def enable_ansi_support(force_color: bool = False):
+    """Prepares :attr:`sys.stdout` and :attr:`sys.stderr` to receive ANSI escape sequences.
+
+    On a legacy Windows console, :mod:`colorama` replaces both streams with wrappers that translate the escape
+    sequences into Win32 console calls. A :class:`Printer` captures its output stream when it is constructed, so call
+    this function first; a printer constructed beforehand writes past the wrapper and its color is lost.
+
+    This function mutates global state, so call it from an application entry point rather than from library code.
+
+    Args:
+        force_color: If :const:`True`, keep the escape sequences even when the output stream is not a terminal.
+            :mod:`colorama` strips them in that case by default, which would discard color that the user explicitly
+            requested.
+
+    """
+    colorama.init(strip=False if force_color else None)
 
 
 class Printer(StatusWriter, RawWriter):
@@ -447,10 +463,10 @@ class Printer(StatusWriter, RawWriter):
 
     def __init__(
             self,
-            out_stream: Optional[Writer] = None,
-            ansi_color: Optional[bool] = None,
+            out_stream: Writer | None = None,
+            ansi_color: bool | None = None,
             quiet: bool = False,
-            options: Optional[Dict[str, Any]] = None
+            options: dict[str, Any] | None = None
     ):
         """Initializes a Printer.
 
@@ -469,7 +485,7 @@ class Printer(StatusWriter, RawWriter):
             out_stream=out_stream,
             quiet=quiet
         )
-        self._context_type: Type[ANSIContext] = ANSIContext
+        self._context_type: type[ANSIContext] = ANSIContext
         self.out_stream: CombiningMarkWriter = CombiningMarkWriter(self)
         """The stream wrapped by this printer."""
         self.indents: int = 0
@@ -478,8 +494,6 @@ class Printer(StatusWriter, RawWriter):
         """The string used for each indent step (default is four spaces)."""
         self._ansi_color = None
         self.ansi_color = ansi_color
-        if self.ansi_color:
-            colorama.init()
         self._strikethrough = False
         self._plusthrough = False
         if options is not None:
@@ -495,7 +509,7 @@ class Printer(StatusWriter, RawWriter):
         return self._ansi_color
 
     @ansi_color.setter
-    def ansi_color(self, is_color: Optional[bool]):
+    def ansi_color(self, is_color: bool | None):
         if is_color is None:
             self._ansi_color = self.out_stream.isatty()
         else:
@@ -571,7 +585,7 @@ class Printer(StatusWriter, RawWriter):
 class HTMLPrinter(Printer):
     """A Printer that outputs in HTML."""
 
-    def __init__(self, *args, title: Optional[str] = None, **kwargs):
+    def __init__(self, *args, title: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._context_type = HTMLANSIContext
         self.raw_write("<html>")
@@ -654,12 +668,40 @@ class HTMLPrinter(Printer):
 DEFAULT_PRINTER: Printer = Printer()
 
 
+def get_default_printer() -> Printer:
+    """Returns the printer that library code uses when the caller does not supply one.
+
+    Call this instead of importing :attr:`DEFAULT_PRINTER` by name. :func:`set_default_printer` rebinds the module
+    attribute, which a name bound by ``from .printer import DEFAULT_PRINTER`` never observes: such a name keeps
+    referring to the printer that was current when the importing module was first loaded.
+
+    Returns:
+        Printer: The printer most recently passed to :func:`set_default_printer`, or :attr:`DEFAULT_PRINTER` if that
+        function was never called.
+
+    """
+    return DEFAULT_PRINTER
+
+
+def set_default_printer(printer: Printer):
+    """Installs :obj:`printer` as the printer returned by :func:`get_default_printer`.
+
+    This mutates global state, so call it from an application entry point rather than from library code.
+
+    Args:
+        printer: The printer to install.
+
+    """
+    global DEFAULT_PRINTER
+    DEFAULT_PRINTER = printer
+
+
 class NullWriter(Writer):
     def write(self, s: str) -> int:
         return 0
 
     def isatty(self) -> bool:
-        return True
+        return False
 
     def flush(self):
         pass

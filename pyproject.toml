@@ -1,12 +1,12 @@
 [build-system]
-requires = ["hatchling>=1.21.0", "hatch-vcs>=0.4.0"]
+requires = ["hatchling>=1.21.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "graphtage"
-description = "A utility to diff tree-like files such as JSON and XML."
+description = "A utility to diff tree-like files such as JSON, JSON5, XML, HTML, YAML, TOML, INI, CSV, plist, and Python pickle."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "LGPL-3.0-or-later"}
 authors = [
     {name = "Trail of Bits"},
@@ -17,39 +17,41 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Utilities",
 ]
 dependencies = [
     "colorama",
     "fickling>=0.1.3",
     "intervaltree",
-    "json5==0.9.5",
-    "numpy>=1.19.4",
+    "json5>=0.9.5",
+    "numpy>=1.26",
     "PyYAML",
-    "scipy>=1.4.0",
+    "scipy>=1.11",
     "toml>=0.10.2",
     "tqdm",
-    "typing_extensions>=3.7.4.3",
+    # Graphtage itself needs nothing from typing_extensions. fickling does: fickle.py imports
+    # typing_extensions.Buffer on Python < 3.12 without declaring the dependency, so importing
+    # graphtage.pickle fails on 3.10 and 3.11 unless something else installs it.
+    "typing_extensions; python_version < '3.12'",
 ]
 dynamic = ["version"]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "ruff>=0.1.0",
+    "ruff>=0.16.0,<1.0",
     "sphinx>=5.0.0",
     "sphinx_rtd_theme==3.0.2",
-    "twine>=4.0.0",
 ]
 
 [project.scripts]
 graphtage = "graphtage.__main__:main"
+graphtage-git-diff = "graphtage.git:main"
 
 [project.urls]
 Homepage = "https://github.com/trailofbits/graphtage"
@@ -80,8 +82,10 @@ include = [
 packages = ["graphtage"]
 
 [tool.ruff]
-target-version = "py38"
+target-version = "py310"
 line-length = 120
+
+[tool.ruff.lint]
 select = [
     "E",     # pycodestyle errors
     "W",     # pycodestyle warnings
@@ -93,21 +97,35 @@ select = [
     "SIM",   # flake8-simplify
     "TID",   # flake8-tidy-imports
     "RUF",   # Ruff-specific rules
+    # `exit` and `quit` come from the site module, which a PyInstaller binary runs without, so a
+    # bare `exit()` raises NameError in the binary distribution and nowhere else.
+    "PLR1722",  # sys-exit-alias
 ]
 ignore = [
     "E501",  # line too long (handled by formatter)
     "B008",  # do not perform function calls in argument defaults
     "B904",  # raise without from inside except
     "SIM108", # use ternary operator instead of if-else block
+    # Collapsing an if/elif chain whose arms are identical turns short, readable branches into
+    # one long unparenthesized and/or expression. Several of these run past 150 characters.
+    "SIM114", # if-with-same-arms
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "test/**/*.py" = [
     "F401",  # unused imports in tests
     "F841",  # unused variables in tests
 ]
+# The import order here is load-bearing: the star imports must run before the plain submodule
+# imports, because graphtage/ast.py does `from . import DictNode, ...`. The star imports are also
+# what `SUBMODULES_TO_SUBSUME` relies on to hoist submodule classes to the top-level package.
+"graphtage/__init__.py" = [
+    "I001",  # unsorted imports
+    "F401",  # unused imports
+    "F403",  # star imports
+]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["graphtage"]
 
 [tool.pytest.ini_options]

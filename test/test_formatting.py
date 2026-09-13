@@ -1,11 +1,13 @@
 import csv
 import json
+import os
 import plistlib
 import random
+import time
 from functools import partial, wraps
 from io import StringIO
-from typing import FrozenSet, Optional, Tuple, Type, Union
 from unittest import TestCase
+from unittest.mock import patch
 
 import toml
 import yaml
@@ -14,11 +16,12 @@ from tqdm import trange
 import graphtage
 from graphtage import xml
 
+from .timing import run_with_time_limit
 
-STR_BYTES: FrozenSet[str] = frozenset([
+STR_BYTES: frozenset[str] = frozenset([
     chr(i) for i in range(32, 127)
 ] + ['\n', '\t', '\r'])
-LETTERS: Tuple[str, ...] = tuple(
+LETTERS: tuple[str, ...] = tuple(
     chr(i) for i in range(ord('a'), ord('z'))
 ) + tuple(
     chr(i) for i in range(ord('A'), ord('Z'))
@@ -27,6 +30,72 @@ LETTERS: Tuple[str, ...] = tuple(
 FILETYPE_TEST_PREFIX = 'test_'
 FILETYPE_TEST_SUFFIX = '_formatting'
 
+SEED_ENVIRONMENT_VARIABLE = 'GRAPHTAGE_TEST_SEED'
+"""The environment variable that replays a previous run's random documents."""
+
+ITERATION_TIME_LIMIT_SECONDS = 30
+"""The wall-clock budget for a single fuzzing iteration.
+
+A healthy iteration takes well under a second on the documents these generators produce, so an iteration that
+approaches this budget is a performance bug rather than an unlucky draw. Failing at the budget keeps a
+pathological document visible and reproducible instead of letting it stall the job for hours.
+
+"""
+
+
+def _resolve_run_seed() -> int:
+    """Returns the seed for this run, taken from :data:`SEED_ENVIRONMENT_VARIABLE` when it is set."""
+    configured = os.environ.get(SEED_ENVIRONMENT_VARIABLE)
+    if configured is None:
+        return random.randrange(2 ** 32)
+    try:
+        return int(configured)
+    except ValueError:
+        raise ValueError(f'{SEED_ENVIRONMENT_VARIABLE} must be an integer, not {configured!r}')
+
+
+RUN_SEED: int = _resolve_run_seed()
+"""The seed for this run. Every random document is derived from it, so setting it replays the whole run."""
+
+
+def _resolve_filetype(name: str) -> graphtage.Filetype:
+    """Returns the filetype that a test function named ``test_<filetype>_formatting`` exercises."""
+    if not name.startswith(FILETYPE_TEST_PREFIX):
+        raise ValueError(f'@filetype_test {name} must start with "{FILETYPE_TEST_PREFIX}"')
+    elif not name.endswith(FILETYPE_TEST_SUFFIX):
+        raise ValueError(f'@filetype_test {name} must end with "{FILETYPE_TEST_SUFFIX}"')
+    filetype_name = name[len(FILETYPE_TEST_PREFIX):-len(FILETYPE_TEST_SUFFIX)]
+    if filetype_name not in graphtage.FILETYPES_BY_TYPENAME:
+        raise ValueError(
+            f'Filetype "{filetype_name}" for @filetype_test {name} not found in graphtage.FILETYPES_BY_TYPENAME'
+        )
+    return graphtage.FILETYPES_BY_TYPENAME[filetype_name]
+
+
+def _round_trip(test_case: 'TestFormatting', filetype, formatter, test_func, *, test_equality: bool):
+    """Builds one random document, formats it, reparses the result, and checks that nothing was lost."""
+    orig_obj, representation = test_func(test_case)
+    if isinstance(representation, str):
+        representation = representation.encode("utf-8")
+    with graphtage.utils.Tempfile(representation) as t:
+        tree = filetype.build_tree(t)
+        stream = StringIO()
+        printer = graphtage.printer.Printer(out_stream=stream, ansi_color=False)
+        formatter.print(printer, tree)
+        formatted_str = stream.getvalue()
+    with graphtage.utils.Tempfile(formatted_str.encode('utf-8')) as t:
+        try:
+            new_obj = filetype.build_tree(t)
+        except Exception as e:
+            test_case.fail(f"""{filetype.name.upper()} decode error {e}: Original object:
+{orig_obj!r}
+Expected format:
+{representation.decode("utf-8")}
+Actual format:
+{formatted_str!s}""")
+    if test_equality:
+        test_case.assertEqual(tree, new_obj)
+
 
 def filetype_test(test_func=None, *, test_equality: bool = True, iterations: int = 1000):
     if test_func is None:
@@ -34,39 +103,22 @@ def filetype_test(test_func=None, *, test_equality: bool = True, iterations: int
 
     @wraps(test_func)
     def wrapper(self: 'TestFormatting'):
-        name = test_func.__name__
-        if not name.startswith(FILETYPE_TEST_PREFIX):
-            raise ValueError(f'@filetype_test {name} must start with "{FILETYPE_TEST_PREFIX}"')
-        elif not name.endswith(FILETYPE_TEST_SUFFIX):
-            raise ValueError(f'@filetype_test {name} must end with "{FILETYPE_TEST_SUFFIX}"')
-        filetype_name = name[len(FILETYPE_TEST_PREFIX):-len(FILETYPE_TEST_SUFFIX)]
-        if filetype_name not in graphtage.FILETYPES_BY_TYPENAME:
-            raise ValueError(f'Filetype "{filetype_name}" for @filetype_test {name} not found in graphtage.FILETYPES_BY_TYPENAME')
-        filetype = graphtage.FILETYPES_BY_TYPENAME[filetype_name]
+        filetype = _resolve_filetype(test_func.__name__)
         formatter = filetype.get_default_formatter()
+        print(f'{test_func.__name__}: {SEED_ENVIRONMENT_VARIABLE}={RUN_SEED}')
 
-        for _ in trange(iterations):
-            orig_obj, representation = test_func(self)
-            if isinstance(representation, str):
-                representation = representation.encode("utf-8")
-            with graphtage.utils.Tempfile(representation) as t:
-                tree = filetype.build_tree(t)
-                stream = StringIO()
-                printer = graphtage.printer.Printer(out_stream=stream, ansi_color=False)
-                formatter.print(printer, tree)
-                formatted_str = stream.getvalue()
-            with graphtage.utils.Tempfile(formatted_str.encode('utf-8')) as t:
-                try:
-                    new_obj = filetype.build_tree(t)
-                except Exception as e:
-                    self.fail(f"""{filetype_name.upper()} decode error {e}: Original object:
-{orig_obj!r}
-Expected format:
-{representation.decode("utf-8")}
-Actual format:
-{formatted_str!s}""")
-            if test_equality:
-                self.assertEqual(tree, new_obj)
+        for iteration in trange(iterations):
+            random.seed(f'{RUN_SEED}:{filetype.name}:{iteration}')
+            try:
+                with run_with_time_limit(ITERATION_TIME_LIMIT_SECONDS):
+                    _round_trip(self, filetype, formatter, test_func, test_equality=test_equality)
+            except TimeoutError:
+                self.fail(
+                    f'Iteration {iteration} of {test_func.__name__} took longer than '
+                    f'{ITERATION_TIME_LIMIT_SECONDS} seconds. Rerun with '
+                    f'{SEED_ENVIRONMENT_VARIABLE}={RUN_SEED} in the environment to reproduce the document that '
+                    f'caused it.'
+                )
 
     return wrapper
 
@@ -85,7 +137,7 @@ class TestFormatting(TestCase):
         return random.choice([True, False])
 
     @staticmethod
-    def make_random_str(exclude_bytes: FrozenSet[str] = frozenset(), allow_empty_strings: bool = True) -> str:
+    def make_random_str(exclude_bytes: frozenset[str] = frozenset(), allow_empty_strings: bool = True) -> str:
         if allow_empty_strings:
             min_length = 0
         else:
@@ -93,7 +145,7 @@ class TestFormatting(TestCase):
         return ''.join(random.choices(list(STR_BYTES - exclude_bytes), k=random.randint(min_length, 128)))
 
     @staticmethod
-    def make_random_non_container(exclude_bytes: FrozenSet[str] = frozenset(), allow_empty_strings: bool = True):
+    def make_random_non_container(exclude_bytes: frozenset[str] = frozenset(), allow_empty_strings: bool = True):
         return random.choice([
             TestFormatting.make_random_int,
             TestFormatting.make_random_bool,
@@ -106,7 +158,7 @@ class TestFormatting(TestCase):
     @staticmethod
     def _make_random_obj(
             obj_stack,
-            force_container_type: Optional[Type[Union[dict, list]]] = None,
+            force_container_type: type[dict | list] | None = None,
             allow_non_container: bool = True,
             *args,
             **kwargs
@@ -136,15 +188,15 @@ class TestFormatting(TestCase):
             allow_empty_containers: bool = True,
             alternate_containers: bool = False,
             lists_can_contain_dicts: bool = True,
-            force_outer_container_type: Optional[Type[Union[dict, list]]] = None,
+            force_outer_container_type: type[dict | list] | None = None,
             allow_lists: bool = True,
             *args, **kwargs):
         obj_stack = []
         ret = TestFormatting._make_random_obj(
             obj_stack,
+            *args,
             force_container_type=force_outer_container_type,
             allow_non_container=force_outer_container_type is None,
-            *args,
             **kwargs
         )
 
@@ -170,12 +222,12 @@ class TestFormatting(TestCase):
                         if force_string_keys:
                             expanding[TestFormatting.make_random_str(*args, **kwargs)] = \
                                 TestFormatting._make_random_obj(
-                                    obj_stack, force_container_type=force_container_type, *args, **kwargs
+                                    obj_stack, *args, force_container_type=force_container_type, **kwargs
                                 )
                         else:
                             expanding[TestFormatting.make_random_non_container(*args, **kwargs)] = \
                                 TestFormatting._make_random_obj(
-                                    obj_stack, force_container_type=force_container_type, *args, **kwargs
+                                    obj_stack, *args, force_container_type=force_container_type, **kwargs
                                 )
             else:
                 if size == 0 and not allow_empty_containers:
@@ -189,14 +241,65 @@ class TestFormatting(TestCase):
                         force_container_type = None
                     for _ in range(size):
                         expanding.append(TestFormatting._make_random_obj(
-                            obj_stack, force_container_type=force_container_type, *args, **kwargs
+                            obj_stack, *args, force_container_type=force_container_type, **kwargs
                         ))
         return ret
 
     def test_formatter_coverage(self):
-        for name in graphtage.FILETYPES_BY_TYPENAME.keys():
+        for name in graphtage.FILETYPES_BY_TYPENAME:
             if not hasattr(self, f'test_{name}_formatting'):
                 self.fail(f"Filetype {name} is missing a `test_{name}_formatting` test function")
+
+    def test_random_documents_are_reproducible(self):
+        """Every iteration draws from a seed derived from :data:`RUN_SEED`, so recording it replays the run."""
+        random.seed(f'{RUN_SEED}:json:0')
+        first = TestFormatting.make_random_obj(force_string_keys=True)
+        random.seed(f'{RUN_SEED}:json:0')
+        self.assertEqual(first, TestFormatting.make_random_obj(force_string_keys=True))
+
+    def test_slow_iteration_fails_with_the_seed(self):
+        """A pathological document must fail with the seed that produced it, not stall the job."""
+        @filetype_test(iterations=1)
+        def test_json_formatting(_):
+            # Busy-wait rather than sleep, so that this exercises the same interruption path as a pathological
+            # document. The deadline only keeps the test from hanging if the budget fails to interrupt it.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                pass
+
+        with patch(f'{__name__}.ITERATION_TIME_LIMIT_SECONDS', 1), self.assertRaises(AssertionError) as failure:
+            test_json_formatting(self)
+        self.assertIn(f'{SEED_ENVIRONMENT_VARIABLE}={RUN_SEED}', str(failure.exception))
+
+    @staticmethod
+    def render(formatter: graphtage.GraphtageFormatter, node: graphtage.TreeNode) -> str:
+        stream = StringIO()
+        printer = graphtage.printer.Printer(out_stream=stream, ansi_color=False)
+        formatter.print(printer, node)
+        return stream.getvalue()
+
+    def test_unordered_list_renders_like_a_list(self):
+        """An :class:`graphtage.UnorderedListNode` must print exactly as the equivalent list in every format.
+
+        It is a :class:`graphtage.MultiSetNode`, so without a `print_UnorderedListNode` on each format's list
+        formatter it resolves to that format's dictionary formatter instead.
+
+        """
+        def make(node_type):
+            return node_type([graphtage.IntegerNode(i) for i in (1, 2, 3)])
+
+        for name, filetype in graphtage.FILETYPES_BY_TYPENAME.items():
+            formatter = filetype.get_default_formatter()
+            self.assertEqual(
+                self.render(formatter, make(graphtage.ListNode)),
+                self.render(formatter, make(graphtage.UnorderedListNode)),
+                f"{name} renders an UnorderedListNode differently from a ListNode"
+            )
+
+    def test_unordered_list_yaml_round_trip(self):
+        formatter = graphtage.FILETYPES_BY_TYPENAME["yaml"].get_default_formatter()
+        rendered = self.render(formatter, graphtage.UnorderedListNode([graphtage.IntegerNode(i) for i in (1, 2, 3)]))
+        self.assertEqual([1, 2, 3], yaml.safe_load(rendered))
 
     @filetype_test
     def test_json_formatting(self):
@@ -232,6 +335,25 @@ class TestFormatting(TestCase):
             return orig_obj, toml.dumps(orig_obj)
         except (TypeError, ValueError, IndexError) as e:
             self.fail(f"""Invalid random TOML object {orig_obj!r}: {e}""")
+
+    @filetype_test(iterations=200)
+    def test_ini_formatting(self):
+        # Build the writer from the reader's own configuration so the two cannot drift apart:
+        config = graphtage.ini._parser()
+        excluded = frozenset('\t \\\'"\r:[]{}&\n()`|+%<>#*^$@!~_+-=.,;?/')
+        orig_obj = {
+            TestFormatting.make_random_str(exclude_bytes=excluded, allow_empty_strings=False): {
+                TestFormatting.make_random_str(exclude_bytes=excluded, allow_empty_strings=False):
+                    TestFormatting.make_random_str(exclude_bytes=frozenset('\r'), allow_empty_strings=True)
+                for _ in range(random.randint(1, 5))
+            }
+            for _ in range(random.randint(1, 5))
+        }
+        for section, options in orig_obj.items():
+            config[section] = options
+        s = StringIO()
+        config.write(s)
+        return orig_obj, s.getvalue()
 
     @staticmethod
     def make_random_xml() -> xml.XMLElementObj:

@@ -16,17 +16,16 @@ optimal edit sequence is discovered.
 
 import itertools
 import logging
-from typing import Iterator, List, Optional, Sequence, Tuple
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 
-from .bounds import make_distinct, Range
+from .bounds import Range
 from .edits import Insert, Match, Remove
 from .fibonacci import FibonacciHeap
-from .printer import DEFAULT_PRINTER
+from .printer import get_default_printer
 from .sequences import SequenceEdit
 from .tree import Edit, TreeNode
-
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +43,7 @@ def levenshtein_distance(s: str, t: str) -> int:
     """
     rows = len(s) + 1
     cols = len(t) + 1
-    dist: List[List[int]] = [[0] * cols for _ in range(rows)]
+    dist: list[list[int]] = [[0] * cols for _ in range(rows)]
 
     for i in range(1, rows):
         dist[i][0] = i
@@ -52,7 +51,6 @@ def levenshtein_distance(s: str, t: str) -> int:
     for i in range(1, cols):
         dist[0][i] = i
 
-    col = row = 0
     for col in range(1, cols):
         for row in range(1, rows):
             if s[row - 1] == t[col - 1]:
@@ -63,7 +61,7 @@ def levenshtein_distance(s: str, t: str) -> int:
                                  dist[row][col - 1] + 1,
                                  dist[row - 1][col - 1] + cost)
 
-    return dist[row][col]
+    return dist[rows - 1][cols - 1]
 
 
 class EditDistance(SequenceEdit):
@@ -85,9 +83,18 @@ class EditDistance(SequenceEdit):
     """
 
     __slots__ = (
-        'penalty', 'shared_prefix', 'reversed_shared_suffix', 'from_seq', 'to_seq',
-        'edit_matrix', 'path_costs', 'costs', '_fringe_row', '_fringe_col',
-        '_last_fringe', '_EditDistance__edits'
+        '_EditDistance__edits',
+        '_fringe_col',
+        '_fringe_row',
+        '_last_fringe',
+        'costs',
+        'edit_matrix',
+        'from_seq',
+        'path_costs',
+        'penalty',
+        'reversed_shared_suffix',
+        'shared_prefix',
+        'to_seq'
     )
 
     def __init__(
@@ -111,16 +118,17 @@ class EditDistance(SequenceEdit):
         self.penalty: int = insert_remove_penalty
         # Optimization: See if the sequences trivially share a common prefix or suffix.
         # If so, this will quadratically reduce the size of the Levenshtein matrix
-        self.shared_prefix: List[Tuple[TreeNode, TreeNode]] = []
-        for fn, tn in zip(from_seq, to_seq):
+        self.shared_prefix: list[tuple[TreeNode, TreeNode]] = []
+        for fn, tn in zip(from_seq, to_seq, strict=False):
             if fn == tn:
                 self.shared_prefix.append((fn, tn))
             else:
                 break
-        self.reversed_shared_suffix: List[Tuple[TreeNode, TreeNode]] = []
+        self.reversed_shared_suffix: list[tuple[TreeNode, TreeNode]] = []
         for fn, tn in zip(
                 reversed(from_seq[len(self.shared_prefix):]),
-                reversed(to_seq[len(self.shared_prefix):])
+                reversed(to_seq[len(self.shared_prefix):]),
+                strict=False
         ):
             if fn == tn:
                 self.reversed_shared_suffix.append((fn, tn))
@@ -149,21 +157,21 @@ class EditDistance(SequenceEdit):
             sum(node.total_size + self.penalty for node in from_seq) +
             sum(node.total_size + self.penalty for node in to_seq)
         )
-        self.edit_matrix: List[List[Optional[Edit]]] = [
+        self.edit_matrix: list[list[Edit | None]] = [
             [None] * (len(self.from_seq) + 1) for _ in range(len(self.to_seq) + 1)
         ]
         self.path_costs = np.full((len(self.to_seq) + 1, len(self.from_seq) + 1), 0, dtype=np.uint16)
         self.costs = np.full((len(self.to_seq) + 1, len(self.from_seq) + 1), 0, dtype=np.uint64)
         self._fringe_row: int = -1
         self._fringe_col: int = 0
-        self._last_fringe: List[Tuple[int, int]] = []
+        self._last_fringe: list[tuple[int, int]] = []
         super().__init__(
             from_node=from_node,
             to_node=to_node,
             constant_cost=constant_cost,
             cost_upper_bound=cost_upper_bound
         )
-        self.__edits: Optional[List[Edit]] = None
+        self.__edits: list[Edit] | None = None
 
     def _add_node(self, row: int, col: int) -> bool:
         if self.edit_matrix[row][col] is not None or col > len(self.from_seq) or row > len(self.to_seq):
@@ -183,7 +191,7 @@ class EditDistance(SequenceEdit):
         self.edit_matrix[row][col] = edit
         return True
 
-    def _fringe_diagonal(self) -> Iterator[Tuple[int, int]]:
+    def _fringe_diagonal(self) -> Iterator[tuple[int, int]]:
         row, col = self._fringe_row, self._fringe_col
         while row >= 0 and col <= len(self.from_seq):
             yield row, col
@@ -201,42 +209,77 @@ class EditDistance(SequenceEdit):
         for row, col in self._fringe_diagonal():
             self._add_node(row, col)
         if self._fringe_col >= len(self.from_seq):
-            if self._fringe_row < len(self.to_seq):
-                # This is an edge case when the string we are matching from is shorter than the one we are matching to
-                return True
-            return False
-        else:
-            return True
+            # This is an edge case when the string we are matching from is shorter than the one we are matching to
+            return self._fringe_row < len(self.to_seq)
+        return True
 
     def is_complete(self) -> bool:
         """An edit distance edit is only complete once its Levenshtein edit matrix has been fully constructed."""
         return self.edit_matrix is None or self.edit_matrix[-1][-1] is not None
 
-    def _best_match(self, row: int, col: int) -> Tuple[int, int, Edit]:
+    @staticmethod
+    def _exact_cost(edit: Edit) -> int:
+        """Tightens an edit until its bounds are definitive and returns its exact cost.
+
+        Args:
+            edit: The edit to price.
+
+        Returns:
+            int: The exact cost of the edit.
+
+        Raises:
+            ValueError: If the edit cannot be tightened to a definitive bound.
+
+        """
+        while not edit.bounds().definitive() and edit.tighten_bounds():
+            pass
+        bounds = edit.bounds()
+        if not bounds.definitive():
+            raise ValueError(f"Could not tighten {edit!r} to a definitive bound; got {bounds!r}")
+        return bounds.upper_bound
+
+    def _best_match(self, row: int, col: int) -> tuple[int, int, Edit]:
+        """Selects the predecessor cell that reaches this cell of the Levenshtein matrix most cheaply.
+
+        Each candidate is scored by the accumulated cost of its predecessor plus the cost of the edit that
+        transitions from that predecessor to this cell. The number of edits along the path is the secondary
+        key, which prefers a single substitution over an insertion paired with a removal of equal total cost.
+
+        Ties on both keys are broken by direction, in this fixed order: the diagonal (a substitution) wins over
+        both borders, and the border insertion wins over the border removal. Reconstruction walks the matrix
+        backwards, so preferring the insertion here places the removal earlier in the forward edit sequence,
+        matching the convention of listing deletions before additions. This order is part of the output
+        contract: changing it changes the edit sequence for inputs that have several optimal alignments.
+
+        Args:
+            row: The row of the cell, indexing :attr:`EditDistance.to_seq`.
+            col: The column of the cell, indexing :attr:`EditDistance.from_seq`.
+
+        Returns:
+            Tuple[int, int, Edit]: The row and column of the chosen predecessor, and the transition edit.
+
+        """
         if row == 0:
             assert col > 0
             return 0, col - 1, self.edit_matrix[0][col]
         elif col == 0:
             assert row > 0
             return row - 1, col, self.edit_matrix[row][0]
-        else:
-            dcost = (self.costs[row - 1][col - 1], self.path_costs[row - 1][col - 1])
-            lcost = (self.costs[row][col - 1], self.path_costs[row][col - 1])
-            ucost = (self.costs[row - 1][col], self.path_costs[row - 1][col])
-            diag_is_best = dcost <= lcost and dcost <= ucost
-            if diag_is_best:
-                make_distinct(self.edit_matrix[row][col], self.edit_matrix[row][0], self.edit_matrix[0][col])
-            if diag_is_best and \
-                    self.edit_matrix[row][col].bounds() < self.edit_matrix[row][0].bounds() and \
-                    self.edit_matrix[row][col].bounds() < self.edit_matrix[0][col].bounds():
-                brow, bcol, edit = row - 1, col - 1, self.edit_matrix[row][col]
-            elif ucost <= dcost:
-                brow, bcol, edit = row - 1, col, self.edit_matrix[row][0]
-            else:
-                brow, bcol, edit = row, col - 1, self.edit_matrix[0][col]
-            self.path_costs[row][col] = self.path_costs[brow][bcol] + 1
-            self.costs[row][col] = self.costs[brow][bcol] + edit.bounds().upper_bound
-            return brow, bcol, edit
+        best_key: tuple[int, int] | None = None
+        best: tuple[int, int, Edit] | None = None
+        for prev_row, prev_col, edit in (
+                (row - 1, col - 1, self.edit_matrix[row][col]),
+                (row - 1, col, self.edit_matrix[row][0]),
+                (row, col - 1, self.edit_matrix[0][col]),
+        ):
+            key = (
+                int(self.costs[prev_row][prev_col]) + self._exact_cost(edit),
+                int(self.path_costs[prev_row][prev_col]) + 1,
+            )
+            if best_key is None or key < best_key:
+                best_key, best = key, (prev_row, prev_col, edit)
+        self.costs[row][col], self.path_costs[row][col] = best_key
+        return best
 
     def tighten_bounds(self) -> bool:
         """Tightens the bounds of this edit, if possible.
@@ -271,8 +314,9 @@ class EditDistance(SequenceEdit):
                 fringe_ranges = {}
                 fringe_total = 0
                 num_diagonals = 0
+                printer = get_default_printer()
 
-                if not DEFAULT_PRINTER.quiet:
+                if not printer.quiet:
                     fringe_ranges = {
                         (row, col): (
                             self.edit_matrix[row][col].bounds().upper_bound
@@ -283,7 +327,7 @@ class EditDistance(SequenceEdit):
                     fringe_total = sum(fringe_ranges.values())
                     num_diagonals = len(self.from_seq) + len(self.to_seq)
 
-                with DEFAULT_PRINTER.tqdm(
+                with printer.tqdm(
                         total=fringe_total,
                         initial=0,
                         desc=f"Tightening Fringe Diagonal {self._fringe_row + self._fringe_col} of {num_diagonals}",
@@ -318,6 +362,9 @@ class EditDistance(SequenceEdit):
             Range: The bounds on the cost of this edit.
 
         """
+        if not self.from_seq and not self.to_seq:
+            # The shared prefix and suffix consumed both sequences, so every edit is a zero-cost match
+            return Range(0, 0)
         base_bounds: Range = super().bounds()
         if self.is_complete():
             if self.__edits is None:
@@ -350,7 +397,7 @@ class EditDistance(SequenceEdit):
 
     def edits(self) -> Iterator[Edit]:
         if self.__edits is None:
-            reversed_suffix: List[Edit] = [
+            reversed_suffix: list[Edit] = [
                 Match(from_node, to_node, 0) for from_node, to_node in self.reversed_shared_suffix
             ]
             if self.to_seq or self.from_seq:

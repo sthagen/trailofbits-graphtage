@@ -1,24 +1,26 @@
+from io import StringIO
 from unittest import TestCase
 
 from graphtage import IntegerNode, Replace, StringNode
 from graphtage.dataclasses import DataClassEdit, DataClassNode
+from graphtage.printer import Fore, Printer
 
 
 class TestDataclasses(TestCase):
     def test_inheritance(self):
         class Foo(DataClassNode):
             foo: IntegerNode
-            initialized = False
+            foo_initialized = False
 
             def post_init(self):
-                self.initialized = True
+                self.foo_initialized = True
 
         class Bar(Foo):
             bar: StringNode
-            initialized = False
+            bar_initialized = False
 
             def post_init(self):
-                self.initialized = True
+                self.bar_initialized = True
 
         self.assertEqual(("foo",), Foo._SLOTS)
         self.assertEqual(0, len(Foo._DATA_CLASS_ANCESTORS))
@@ -28,13 +30,15 @@ class TestDataclasses(TestCase):
         b = Bar(foo=IntegerNode(10), bar=StringNode("bar"))
         self.assertEqual(10, b.foo.object)
         self.assertEqual("bar", b.bar.object)
-        self.assertTrue(b.initialized)
+        self.assertTrue(b.foo_initialized)
+        self.assertTrue(b.bar_initialized)
 
         # now test a mixture of positional and keyword arguments
         b = Bar(StringNode("bar"), foo=IntegerNode(10))
         self.assertEqual(10, b.foo.object)
         self.assertEqual("bar", b.bar.object)
-        self.assertTrue(b.initialized)
+        self.assertTrue(b.foo_initialized)
+        self.assertTrue(b.bar_initialized)
 
         # test equality
         self.assertEqual(Bar(IntegerNode(10), StringNode("bar")), b)
@@ -47,6 +51,99 @@ class TestDataclasses(TestCase):
         c = Foo(IntegerNode(12))
         edit = f.edits(c)
         self.assertIsInstance(edit, DataClassEdit)
+
+    def test_post_init_runs_once_per_implementation(self):
+        calls: list[tuple[str, str]] = []
+
+        class Base(DataClassNode):
+            base: IntegerNode
+
+            def post_init(self):
+                calls.append(("Base", type(self).__name__))
+
+        class Middle(Base):
+            middle: StringNode
+
+        class Derived(Middle):
+            derived: IntegerNode
+
+            def post_init(self):
+                calls.append(("Derived", type(self).__name__))
+
+        Base(IntegerNode(1))
+        self.assertEqual([("Base", "Base")], calls)
+
+        # Middle inherits Base.post_init without overriding it, so it must run exactly once
+        calls.clear()
+        Middle(IntegerNode(1), StringNode("middle"))
+        self.assertEqual([("Base", "Middle")], calls)
+
+        # each implementation runs once, least derived first
+        calls.clear()
+        Derived(IntegerNode(1), StringNode("middle"), IntegerNode(2))
+        self.assertEqual([("Base", "Derived"), ("Derived", "Derived")], calls)
+
+    def test_post_init_runs_for_direct_subclass(self):
+        class Unquoted(DataClassNode):
+            name: StringNode
+
+            def post_init(self):
+                self.name.quoted = False
+
+        self.assertFalse(Unquoted(StringNode("name")).name.quoted)
+
+    def test_multiple_inheritance(self):
+        """Slots from *all* bases must survive diamond inheritance, not just the first chain."""
+        class Foo(DataClassNode):
+            foo: IntegerNode
+
+        class Bar(Foo):
+            bar: StringNode
+
+        class Baz(Foo):
+            baz: StringNode
+
+        class Quux(Bar, Baz):
+            quux: IntegerNode
+
+        self.assertEqual(("foo",), Foo._SLOTS)
+        self.assertEqual(("foo", "bar"), Bar._SLOTS)
+        self.assertEqual(("foo", "baz"), Baz._SLOTS)
+        self.assertEqual(("foo", "baz", "bar", "quux"), Quux._SLOTS)
+        self.assertEqual(
+            {"foo": IntegerNode, "baz": StringNode, "bar": StringNode, "quux": IntegerNode},
+            Quux._SLOT_ANNOTATIONS
+        )
+
+        node = Quux(foo=IntegerNode(1), bar=StringNode("bar"), baz=StringNode("baz"), quux=IntegerNode(4))
+        self.assertEqual(1, node.foo.object)
+        self.assertEqual("bar", node.bar.object)
+        self.assertEqual("baz", node.baz.object)
+        self.assertEqual(4, node.quux.object)
+        self.assertEqual({"foo", "bar", "baz", "quux"}, set(node.to_obj()))
+
+        # diffing against an identical node yields a DataClassEdit, not a Replace
+        twin = Quux(foo=IntegerNode(1), bar=StringNode("bar"), baz=StringNode("baz"), quux=IntegerNode(4))
+        self.assertIsInstance(node.edits(twin), DataClassEdit)
+
+    def test_print_renders_slots(self):
+        """:meth:`DataClassNode.print` is the fallback when no formatter resolves the node type."""
+        class Foo(DataClassNode):
+            name: StringNode
+            count: IntegerNode
+
+        stream = StringIO()
+        Foo(name=StringNode("x"), count=IntegerNode(3)).print(Printer(out_stream=stream, ansi_color=False))
+        self.assertEqual('Foo(name="x", count=3)', stream.getvalue())
+
+    def test_print_colors_the_class_name_yellow(self):
+        """The class name must be yellow; ``Fore.Yellow`` used to raise :exc:`AttributeError` here."""
+        class Foo(DataClassNode):
+            name: StringNode
+
+        stream = StringIO()
+        Foo(name=StringNode("x")).print(Printer(out_stream=stream, ansi_color=True))
+        self.assertIn(f"{Fore.YELLOW}Foo", stream.getvalue())
 
     def test_inheritance_with_duplicate(self):
         def define_duplicate():

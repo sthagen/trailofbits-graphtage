@@ -6,16 +6,48 @@ import sys
 
 from colorama.ansi import Fore
 
-from . import expressions
-from . import graphtage
+from . import expressions, graphtage, version
 from . import printer as printermodule
-from . import version
 from .constraints import MatchIf, MatchUnless
-from .printer import HTMLPrinter, Printer
+from .printer import HTMLPrinter, Printer, enable_ansi_support
 from .utils import Tempfile
 
-
 log = logging.getLogger('graphtage')
+
+EXIT_SUCCESS = 0
+"""The exit status used when the two inputs are semantically identical."""
+
+EXIT_DIFFERENCES_FOUND = 1
+"""The exit status used when the two inputs differ."""
+
+EXIT_ERROR = 2
+"""The exit status used when Graphtage could not compute a diff."""
+
+EXIT_BROKEN_PIPE = 141
+"""The exit status used when the process reading Graphtage's output closed the pipe.
+
+This is ``128 + SIGPIPE``, the status a shell reports for a process that a broken pipe terminated. Python ignores
+``SIGPIPE`` and raises :exc:`BrokenPipeError` instead, so Graphtage reports the status itself.
+"""
+
+
+def silence_broken_pipe() -> None:
+    """Redirects standard output to the null device after the reader closed the pipe.
+
+    CPython flushes :data:`sys.stdout` while the interpreter shuts down, and that flush raises a second
+    :exc:`BrokenPipeError` that is printed as ``Exception ignored`` however the first one was handled. Pointing the
+    underlying file descriptor at :data:`os.devnull` lets the final flush, and any write that still happens while
+    Graphtage cleans up, succeed silently.
+    """
+    try:
+        stdout_fd = sys.stdout.fileno()
+    except (OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, stdout_fd)
+    finally:
+        os.close(devnull)
 
 
 class PathOrStdin:
@@ -37,9 +69,38 @@ class PathOrStdin:
             return self._tempfile.__exit__(*args, **kwargs)
 
 
+def register_mimetypes():
+    """Registers the MIME types of the file formats that Graphtage supports.
+
+    :func:`mimetypes.guess_type` does not know about several of the formats that Graphtage parses, and the types it
+    does know about vary between platforms. This adds the missing types without overriding any that the platform
+    already provides.
+    """
+    mimetypes.init()
+    if '.yml' not in mimetypes.types_map and '.yaml' not in mimetypes.types_map:
+        mimetypes.add_type('application/x-yaml', '.yml')
+        mimetypes.suffix_map['.yaml'] = '.yml'
+    elif '.yml' not in mimetypes.types_map:
+        mimetypes.suffix_map['.yml'] = '.yaml'
+    elif '.yaml' not in mimetypes.types_map:
+        mimetypes.suffix_map['.yaml'] = '.yml'
+    if '.json5' not in mimetypes.types_map:
+        mimetypes.add_type('application/json5', '.json5')
+    if '.toml' not in mimetypes.types_map:
+        mimetypes.add_type('application/toml', '.toml')
+    if '.ini' not in mimetypes.types_map:
+        mimetypes.add_type('text/ini', '.ini')
+    if '.plist' not in mimetypes.types_map:
+        mimetypes.add_type('application/x-plist', '.plist')
+    if '.pkl' not in mimetypes.types_map and '.pickle' not in mimetypes.types_map:
+        mimetypes.add_type('application/x-python-pickle', '.pkl')
+        mimetypes.suffix_map['.pickle'] = '.pkl'
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description='A diff utility for tree-like files such as JSON, XML, HTML, YAML, and CSV.'
+        description='A diff utility for tree-like files such as JSON, JSON5, XML, HTML, YAML, TOML, INI, CSV, plist, '
+                    'and Python pickle.'
     )
     parser.add_argument('FROM_PATH', type=str, nargs='?', default='-',
                         help='the source file to diff; pass \'-\' to read from STDIN')
@@ -79,10 +140,12 @@ def main(argv=None) -> int:
             help=f'equivalent to `--to-mime {mime}`'
         )
     parser.add_argument('--match-if', '-m', type=str, default=None,
-                        help='only attempt to match two dictionaries if the provided expression is satisfied. For '
-                             'example, `--match-if "from[\'foo\'] == to[\'bar\']"` will mean that only a dictionary '
-                             'which has a "foo" key that has the same value as the other dictionary\'s "bar" key will '
-                             'be attempted to be paired')
+                        help='only attempt to match two nodes if the provided expression is satisfied. `from` and '
+                             '`to` are bound to the plain Python values of the two nodes. For example, `--match-if '
+                             '"from[\'foo\'] == to[\'bar\']"` will mean that only a dictionary which has a "foo" key '
+                             'that has the same value as the other dictionary\'s "bar" key will be attempted to be '
+                             'paired. A pair for which the expression raises an error, such as the strings and '
+                             'numbers beneath a dictionary, is left unconstrained')
     parser.add_argument('--match-unless', '-u', type=str, default=None,
                         help='similar to `--match-if`, but only attempt a match if the provided expression evaluates '
                              'to `False`')
@@ -141,6 +204,13 @@ def main(argv=None) -> int:
         action='store_true',
         help='do not consider removal and insertion when comparing lists that are the same length'
     )
+    list_edit_group.add_argument(
+        '--ignore-list-order',
+        action='store_true',
+        help='match the elements of a list as an unordered collection, so reordering a list is not an edit; '
+             'duplicate elements still count, and matching two lists that differ can be much slower than the '
+             'default'
+    )
     parser.add_argument(
         '--no-status',
         action='store_true',
@@ -148,11 +218,11 @@ def main(argv=None) -> int:
     )
     log_section = parser.add_argument_group(title='logging')
     log_group = log_section.add_mutually_exclusive_group()
-    log_group.add_argument('--log-level', type=str, default='INFO', choices=list(
+    log_group.add_argument('--log-level', type=str, default='INFO', choices=[
         logging.getLevelName(x)
         for x in range(1, 101)
         if not logging.getLevelName(x).startswith('Level')
-    ), help='sets the log level for Graphtage (default=INFO)')
+    ], help='sets the log level for Graphtage (default=INFO)')
     log_group.add_argument('--debug', action='store_true', help='equivalent to `--log-level=DEBUG`')
     log_group.add_argument('--quiet', action='store_true', help='equivalent to `--log-level=CRITICAL --no-status`')
     parser.add_argument('--version', '-v', action='store_true', help='print Graphtage\'s version information to STDERR')
@@ -172,16 +242,16 @@ def main(argv=None) -> int:
         numeric_log_level = getattr(logging, args.log_level.upper(), None)
         if not isinstance(numeric_log_level, int):
             sys.stderr.write(f'Invalid log level: {args.log_level}')
-            exit(1)
+            sys.exit(EXIT_ERROR)
 
     if args.dumpversion:
-        print(' '.join(map(str, version.__version__)))
-        exit(0)
+        print(version.VERSION_STRING)
+        sys.exit(0)
 
     if args.version:
         sys.stderr.write(f"Graphtage version {version.VERSION_STRING}\n")
         if args.FROM_PATH == '-' and args.TO_PATH == '-':
-            exit(0)
+            sys.exit(0)
 
     if args.no_color:
         ansi_color = False
@@ -190,63 +260,53 @@ def main(argv=None) -> int:
     else:
         ansi_color = None
 
+    enable_ansi_support(force_color=bool(args.color))
+
     if args.html:
         from_file = os.path.basename(args.FROM_PATH)
         to_file = os.path.basename(args.TO_PATH)
 
         def printer_type(*pos_args, **kwargs):
-            return HTMLPrinter(title=f"Graphtage Diff of {from_file} and {to_file}", *pos_args, **kwargs)
+            return HTMLPrinter(*pos_args, title=f"Graphtage Diff of {from_file} and {to_file}", **kwargs)
     else:
         printer_type = Printer
 
-    printer = printer_type(
-        sys.stdout,
-        ansi_color=ansi_color,
-        quiet=args.no_status or args.quiet,
-        options={
-            'join_lists': args.condensed or args.join_lists,
-            'join_dict_items': args.condensed or args.join_dict_items
-        }
-    )
-    printermodule.DEFAULT_PRINTER = printer
+    try:
+        printer = printer_type(
+            sys.stdout,
+            ansi_color=ansi_color,
+            quiet=args.no_status or args.quiet,
+            options={
+                'join_lists': args.condensed or args.join_lists,
+                'join_dict_items': args.condensed or args.join_dict_items
+            }
+        )
+    except BrokenPipeError:
+        silence_broken_pipe()
+        return EXIT_BROKEN_PIPE
+    printermodule.set_default_printer(printer)
 
     logging.basicConfig(level=numeric_log_level, stream=Printer(
         sys.stderr,
         quiet=args.no_status or args.quiet,
     ))
 
-    mimetypes.init()
-    if '.yml' not in mimetypes.types_map and '.yaml' not in mimetypes.types_map:
-        mimetypes.add_type('application/x-yaml', '.yml')
-        mimetypes.suffix_map['.yaml'] = '.yml'
-    elif '.yml' not in mimetypes.types_map:
-        mimetypes.suffix_map['.yml'] = '.yaml'
-    elif '.yaml' not in mimetypes.types_map:
-        mimetypes.suffix_map['.yaml'] = '.yml'
-    if '.json5' not in mimetypes.types_map:
-        mimetypes.add_type('application/json5', '.json5')
-    if '.toml' not in mimetypes.types_map:
-        mimetypes.add_type('application/toml', '.toml')
-    if '.plist' not in mimetypes.types_map:
-        mimetypes.add_type('application/x-plist', '.plist')
-    if '.pkl' not in mimetypes.types_map and '.pickle' not in mimetypes.types_map:
-        mimetypes.add_type('application/x-python-pickle', '.pkl')
-        mimetypes.suffix_map['.pickle'] = '.pkl'
+    register_mimetypes()
 
     if args.from_mime is not None:
         from_mime = args.from_mime
     else:
-        for typename in graphtage.FILETYPES_BY_TYPENAME.keys():
+        for typename in graphtage.FILETYPES_BY_TYPENAME:
             from_mime = getattr(args, f'from_{typename}')
             if from_mime is not None:
                 break
         else:
             from_mime = None
 
-    if args.from_mime is not None:
-        to_mime = args.from_mime
+    if args.to_mime is not None:
+        to_mime = args.to_mime
     else:
-        for typename in graphtage.FILETYPES_BY_TYPENAME.keys():
+        for typename in graphtage.FILETYPES_BY_TYPENAME:
             to_mime = getattr(args, f'to_{typename}')
             if to_mime is not None:
                 break
@@ -279,79 +339,89 @@ def main(argv=None) -> int:
         allow_key_edits=allow_key_edits,
         auto_match_keys=auto_match_keys,
         allow_list_edits=not args.no_list_edits,
-        allow_list_edits_when_same_length=not args.no_list_edits_when_same_length
+        allow_list_edits_when_same_length=not args.no_list_edits_when_same_length,
+        ignore_list_order=args.ignore_list_order
     )
 
+    broken_pipe = False
     try:
         with printer:
             options.printer = printer
-            with PathOrStdin(args.FROM_PATH) as from_path:
-                with PathOrStdin(args.TO_PATH) as to_path:
-                    try:
-                        from_format = graphtage.get_filetype(from_path, from_mime)
-                        to_format = graphtage.get_filetype(to_path, to_mime)
-                    except ValueError as e:
-                        sys.stderr.write(f"Error: {e!s}\n\n")
-                        return 1
-                    with printer.tqdm(desc=f"Loading {from_path!s}", total=2, leave=False) as t:
-                        from_tree = from_format.build_tree_handling_errors(from_path, options)
-                        t.desc = f"Loading {to_path!s}"
-                        t.update(1)
-                        if isinstance(from_tree, str):
-                            sys.stderr.write(from_tree)
-                            sys.stderr.write('\n\n')
-                            return 1
-                        to_tree = to_format.build_tree_handling_errors(to_path, options)
-                        t.update(1)
-                        if isinstance(to_tree, str):
-                            sys.stderr.write(to_tree)
-                            sys.stderr.write('\n\n')
-                            return 1
-                    if match_if is not None or match_unless is not None:
-                        for node in from_tree.dfs():
-                            if match_if is not None:
-                                MatchIf.apply(node, match_if)
-                            if match_unless is not None:
-                                MatchUnless.apply(node, match_unless)
-                    had_edits = False
-                    if args.only_edits:
-                        for edit in from_tree.get_all_edits(to_tree):
-                            printer.write(str(edit))
-                            printer.newline()
-                            had_edits = had_edits or edit.has_non_zero_cost()
-                    elif args.edit_digest:
-                        if args.format is not None:
-                            formatter = graphtage.FILETYPES_BY_TYPENAME[args.format].get_default_formatter()
-                        else:
-                            formatter = from_format.get_default_formatter()
-
-                        for ancestors, edit in from_tree.get_all_edit_contexts(to_tree):
-                            for i, node in enumerate(ancestors):
-                                if node.parent is not None:
-                                    node.parent.print_parent_context(printer, for_child=node)
-                                if i == len(ancestors) - 1:
-                                    with printer.color(Fore.BLUE):
-                                        printer.write(" -> ")
-                                    formatter.print(printer, edit)
-                            printer.newline()
-                            had_edits = had_edits or edit.has_non_zero_cost()
+            with PathOrStdin(args.FROM_PATH) as from_path, PathOrStdin(args.TO_PATH) as to_path:
+                try:
+                    from_format = graphtage.get_filetype(from_path, from_mime)
+                    to_format = graphtage.get_filetype(to_path, to_mime)
+                except ValueError as e:
+                    sys.stderr.write(f"Error: {e!s}\n\n")
+                    return EXIT_ERROR
+                with printer.tqdm(desc=f"Loading {from_path!s}", total=2, leave=False) as t:
+                    from_tree = from_format.build_tree_handling_errors(from_path, options)
+                    t.desc = f"Loading {to_path!s}"
+                    t.update(1)
+                    if isinstance(from_tree, str):
+                        sys.stderr.write(from_tree)
+                        sys.stderr.write('\n\n')
+                        return EXIT_ERROR
+                    to_tree = to_format.build_tree_handling_errors(to_path, options)
+                    t.update(1)
+                    if isinstance(to_tree, str):
+                        sys.stderr.write(to_tree)
+                        sys.stderr.write('\n\n')
+                        return EXIT_ERROR
+                if match_if is not None or match_unless is not None:
+                    for node in from_tree.dfs():
+                        if match_if is not None:
+                            MatchIf.apply(node, match_if)
+                        if match_unless is not None:
+                            MatchUnless.apply(node, match_unless)
+                had_edits = False
+                if args.only_edits:
+                    for edit in from_tree.get_all_edits(to_tree):
+                        printer.write(str(edit))
+                        printer.newline()
+                        had_edits = had_edits or edit.has_non_zero_cost()
+                elif args.edit_digest:
+                    if args.format is not None:
+                        formatter = graphtage.FILETYPES_BY_TYPENAME[args.format].get_default_formatter()
                     else:
-                        diff = from_tree.diff(to_tree)
-                        if args.format is not None:
-                            formatter = graphtage.FILETYPES_BY_TYPENAME[args.format].get_default_formatter()
-                        else:
-                            formatter = from_format.get_default_formatter()
-                        formatter.print(printer, diff)
-                        had_edits = any(any(e.has_non_zero_cost() for e in n.edit_list) for n in diff.dfs())
+                        formatter = from_format.get_default_formatter()
+
+                    for ancestors, edit in from_tree.get_all_edit_contexts(to_tree):
+                        for i, node in enumerate(ancestors):
+                            if node.parent is not None:
+                                node.parent.print_parent_context(printer, for_child=node)
+                            if i == len(ancestors) - 1:
+                                with printer.color(Fore.BLUE):
+                                    printer.write(" -> ")
+                                formatter.print(printer, edit)
+                        printer.newline()
+                        had_edits = had_edits or edit.has_non_zero_cost()
+                else:
+                    diff = from_tree.diff(to_tree)
+                    if args.format is not None:
+                        formatter = graphtage.FILETYPES_BY_TYPENAME[args.format].get_default_formatter()
+                    else:
+                        formatter = from_format.get_default_formatter()
+                    formatter.print(printer, diff)
+                    had_edits = any(any(e.has_non_zero_cost() for e in n.edit_list) for n in diff.dfs())
             printer.write('\n')
     except KeyboardInterrupt:
         return -2  # SIGINT
+    except BrokenPipeError:
+        silence_broken_pipe()
+        broken_pipe = True
     finally:
-        printer.close()
+        try:
+            printer.close()
+        except BrokenPipeError:
+            silence_broken_pipe()
+            broken_pipe = True
+    if broken_pipe:
+        return EXIT_BROKEN_PIPE
     if had_edits:
-        return 1
+        return EXIT_DIFFERENCES_FOUND
     else:
-        return 0
+        return EXIT_SUCCESS
 
 
 if __name__ == '__main__':

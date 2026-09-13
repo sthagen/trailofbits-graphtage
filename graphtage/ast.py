@@ -3,7 +3,7 @@ Generic node types for representing abstract syntax trees.
 """
 from colorama import Fore
 
-from . import KeyValuePairNode, ListNode, Printer, TreeNode, DictNode, StringNode
+from . import DictNode, KeyValuePairNode, ListNode, Printer, StringNode, TreeNode
 from .dataclasses import DataClassNode
 from .sequences import SequenceFormatter
 
@@ -87,7 +87,7 @@ class Subscript(DataClassNode):
         self.value.print(printer)
         with printer.color(Fore.LIGHTBLUE_EX):
             printer.write("[")
-        self.slice.write(printer)
+        self.slice.print(printer)
         with printer.color(Fore.LIGHTBLUE_EX):
             printer.write("]")
 

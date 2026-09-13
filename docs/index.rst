@@ -2,14 +2,15 @@ Graphtage Documentation
 =======================
 
 Graphtage is *both* a commandline utility *and* a general purpose library for semantically comparing and merging
-tree-like structures, such as JSON, XML, HTML, YAML, and CSV files. Its name is a portmanteau of “graph” and
+tree-like structures, such as JSON, JSON5, XML, HTML, YAML, TOML, INI, CSV, plist, and Python pickle files. Its name is
+a portmanteau of “graph” and
 “graftage”—the latter being the practice of joining two trees together such that they grow as one.
 
 There are several reasons why you might be here…
 
 .. topic:: You want to learn how to use Graphtage as a command line utility.
 
-    This documentation focuses on Graphtage’ use as a library, specifically how to extend it by implementing new file
+    This documentation focuses on Graphtage’s use as a library, specifically how to extend it by implementing new file
     formats. For instructions on using Graphtage as a utility, see the documentation in its `GitHub page`_.
 
 .. topic:: You want to programmatically interact with Graphtage as a library.
@@ -29,6 +30,10 @@ There are several reasons why you might be here…
 
     Documentation on how Graphtage works is :doc:`here <howitworks>`.
 
+.. topic:: You maintain Graphtage and need to cut a release.
+
+    The release procedure is documented in :doc:`Cutting a Release <releasing>`.
+
 .. _GitHub page: https://github.com/trailofbits/graphtage
 
 .. toctree::
@@ -38,6 +43,7 @@ There are several reasons why you might be here…
    library
    extending
    howitworks
+   releasing
    package
 
 Indices and tables

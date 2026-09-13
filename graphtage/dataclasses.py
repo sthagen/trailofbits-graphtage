@@ -1,8 +1,9 @@
-from typing import Dict, Iterator, List, Tuple, Type
+from collections.abc import Callable, Iterator
+from typing import get_origin
 
 from . import AbstractCompoundEdit, Edit, Range, Replace
 from .printer import Fore, Printer
-from .tree import ContainerNode, TreeNode
+from .tree import ContainerNode, GraphtageFormatter, TreeNode
 
 
 class DataClassEdit(AbstractCompoundEdit):
@@ -11,7 +12,7 @@ class DataClassEdit(AbstractCompoundEdit):
         to_slots = dict(to_node.items())
         if from_slots.keys() != to_slots.keys():
             raise ValueError(f"Node {from_node!r} cannot be edited to {to_node!r} because they have incompatible slots")
-        self.slot_edits: List[Edit] = [
+        self.slot_edits: list[Edit] = [
             value.edits(to_slots[slot])
             for slot, value in from_slots.items()
         ]
@@ -27,18 +28,30 @@ class DataClassEdit(AbstractCompoundEdit):
         yield from self.slot_edits
 
     def tighten_bounds(self) -> bool:
-        for edit in self.slot_edits:
-            if edit.tighten_bounds():
-                return True
-        return False
+        return any(edit.tighten_bounds() for edit in self.slot_edits)
+
+    def print(self, formatter: GraphtageFormatter, printer: Printer):
+        """Prints this edit by delegating to the formatter for the node being edited.
+
+        The default :meth:`graphtage.AbstractCompoundEdit.print` implementation prints the slot edits back to back,
+        which drops whatever syntax the node's formatter writes between the slots. Delegating to the node formatter
+        keeps that syntax, and the formatter reaches the slot edits as it prints each child.
+
+        This is equivalent to::
+
+            formatter.get_formatter(self.from_node)(printer, self.from_node)
+
+        """
+        formatter.get_formatter(self.from_node)(printer, self.from_node)
 
 
 class DataClassNode(ContainerNode):
     """A container node that can be initialized similar to a Python :func:`dataclasses.dataclass`"""
 
-    _SLOTS: Tuple[str, ...]
-    _SLOT_ANNOTATIONS: Dict[str, Type[TreeNode]]
-    _DATA_CLASS_ANCESTORS: List[Type["DataClassNode"]]
+    _SLOTS: tuple[str, ...]
+    _SLOT_ANNOTATIONS: dict[str, type[TreeNode]]
+    _DATA_CLASS_ANCESTORS: list[type["DataClassNode"]]
+    _POST_INITS: tuple[Callable[["DataClassNode"], None], ...]
 
     def __init__(self, *args, **kwargs):
         """Be careful extending __init__; consider using :func:`DataClassNode.post_init` instead."""
@@ -76,14 +89,15 @@ class DataClassNode(ContainerNode):
             setattr(self, s, value)
         # self.__hash__ gets called so often, we cache the result:
         self.__hash = hash(tuple(self))
-        for ancestor in self._DATA_CLASS_ANCESTORS:
-            ancestor.post_init(self)
+        for post_init in self._POST_INITS:
+            post_init(self)
 
     def post_init(self):
-        """Callback called after this class's members have been initialized.
+        """Callback called after this node's slots have been initialized.
 
-        This callback should not call `super().post_init()`. Each superclass's `post_init()` will be automatically
-        called in order of the `__mro__`.
+        This callback should not call `super().post_init()`. Every implementation in the class hierarchy is called
+        automatically, starting with the least derived data class and ending with the class being instantiated. An
+        implementation that a subclass inherits without overriding is called only once.
         """
         pass
 
@@ -91,30 +105,41 @@ class DataClassNode(ContainerNode):
         super().__init_subclass__(**kwargs)
         ancestors = [
             c
-            for c in cls.__mro__
+            for c in reversed(cls.__mro__)
             if c is not cls and issubclass(c, DataClassNode) and c is not DataClassNode
         ]
         cls._DATA_CLASS_ANCESTORS = ancestors
+        # Selecting on __dict__ keeps an inherited implementation from being called once per class that inherits it.
+        cls._POST_INITS = tuple(
+            c.__dict__["post_init"]
+            for c in (*ancestors, cls)
+            if "post_init" in c.__dict__
+        )
         ancestor_slot_names = {
             name: a
             for a in ancestors
             for name in a._SLOTS
         }
-        if not hasattr(cls, "_SLOT_ANNOTATIONS") or cls._SLOT_ANNOTATIONS is None:
-            cls._SLOT_ANNOTATIONS = {}
-            cls._SLOTS = ()
-        else:
-            cls._SLOT_ANNOTATIONS = dict(cls._SLOT_ANNOTATIONS)
-        new_slots = []
-        for i, (name, slot_type) in enumerate(cls.__annotations__.items()):
+        # Collect the inherited slots from *all* data-class ancestors, which `ancestors` already
+        # lists base-first. Reading the inherited `_SLOT_ANNOTATIONS`/`_SLOTS` attributes instead
+        # would follow only the first inheritance chain, silently dropping the slots of any
+        # additional bases.
+        inherited_slot_annotations: dict[str, type[TreeNode]] = {}
+        for ancestor in ancestors:
+            inherited_slot_annotations.update(ancestor._SLOT_ANNOTATIONS)
+        cls._SLOT_ANNOTATIONS = inherited_slot_annotations
+        for name, slot_type in cls.__annotations__.items():
+            # get_origin() screens out subscripted generics before issubclass() sees them. On Python
+            # 3.10 isinstance(list[int], type) is True, so issubclass() would raise there.
+            if get_origin(slot_type) is not None:
+                continue
             if not isinstance(slot_type, type) or not issubclass(slot_type, TreeNode):
                 continue
             if name in ancestor_slot_names:
                 raise TypeError(f"Dataclass {cls.__name__} cannot redefine slot {name!r} because it is already "
                                 f"defined in its superclass {ancestor_slot_names[name].__name__}")
-            new_slots.append(name)
             cls._SLOT_ANNOTATIONS[name] = slot_type
-        cls._SLOTS = cls._SLOTS + tuple(new_slots)
+        cls._SLOTS = tuple(cls._SLOT_ANNOTATIONS)
 
     def __hash__(self):
         return self.__hash
@@ -123,7 +148,7 @@ class DataClassNode(ContainerNode):
         for _, value in self.items():
             yield value
 
-    def items(self) -> Iterator[Tuple[str, TreeNode]]:
+    def items(self) -> Iterator[tuple[str, TreeNode]]:
         for slot in self._SLOTS:
             yield slot, getattr(self, slot)
 
@@ -145,7 +170,7 @@ class DataClassNode(ContainerNode):
         return sum(s.calculate_total_size() for s in self)
 
     def print(self, printer: Printer):
-        with printer.color(Fore.Yellow):
+        with printer.color(Fore.YELLOW):
             printer.write(self.__class__.__name__)
         printer.write("(")
         for i, slot in enumerate(self._SLOTS):

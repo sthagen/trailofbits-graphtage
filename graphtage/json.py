@@ -1,25 +1,39 @@
 """A :class:`graphtage.Filetype` for parsing, diffing, and rendering `JSON files`_.
 
 .. _JSON files:
-    https://tools.ietf.org/html/std90
+    https://www.rfc-editor.org/info/std90/
 
 """
 
 import json
-import json5
 import os
-from typing import Optional, Union
 
-from .graphtage import BoolNode, BuildOptions, DictNode, Filetype, FixedKeyDictNode, \
-    FloatNode, IntegerNode, KeyValuePairNode, LeafNode, ListNode, NullNode, StringFormatter, StringNode
-from .printer import DEFAULT_PRINTER, Fore, Printer
+import json5
+
+from .graphtage import (
+    BoolNode,
+    BuildOptions,
+    DictNode,
+    Filetype,
+    FixedKeyDictNode,
+    FloatNode,
+    IntegerNode,
+    KeyValuePairNode,
+    LeafNode,
+    ListNode,
+    NullNode,
+    StringFormatter,
+    StringNode,
+    UnorderedListNode,
+)
+from .printer import Fore, Printer, get_default_printer
 from .sequences import SequenceFormatter
 from .tree import ContainerNode, GraphtageFormatter, TreeNode
 
 
 def build_tree(
-        python_obj: Union[int, float, bool, str, bytes, list, dict],
-        options: Optional[BuildOptions] = None,
+        python_obj: int | float | bool | str | bytes | list | dict,
+        options: BuildOptions | None = None,
         force_leaf_node: bool = False) -> TreeNode:
     """Builds a Graphtage tree from an arbitrary Python object.
 
@@ -51,10 +65,15 @@ def build_tree(
         return StringNode(python_obj.decode('utf-8'))
     elif force_leaf_node:
         raise ValueError(f"{python_obj!r} was expected to be an int or string, but was instead a {type(python_obj)}")
-    elif isinstance(python_obj, list) or isinstance(python_obj, tuple):
+    elif isinstance(python_obj, (list, tuple)):
+        children = [
+            build_tree(n, options=options) for n in
+            get_default_printer().tqdm(python_obj, delay=2.0, desc="Loading JSON List", leave=False)
+        ]
+        if options.ignore_list_order:
+            return UnorderedListNode(children, auto_match_keys=options.auto_match_keys)
         return ListNode(
-            [build_tree(n, options=options) for n in
-             DEFAULT_PRINTER.tqdm(python_obj, delay=2.0, desc="Loading JSON List", leave=False)],
+            children,
             allow_list_edits=options.allow_list_edits,
             allow_list_edits_when_same_length=options.allow_list_edits_when_same_length
         )
@@ -62,7 +81,7 @@ def build_tree(
         dict_items = {
             build_tree(k, options=options, force_leaf_node=True):
                 build_tree(v, options=options) for k, v in
-            DEFAULT_PRINTER.tqdm(python_obj.items(), delay=2.0, desc="Loading JSON Dict", leave=False)
+            get_default_printer().tqdm(python_obj.items(), delay=2.0, desc="Loading JSON Dict", leave=False)
         }
         if options.allow_key_edits:
             dict_node = DictNode.from_dict(dict_items)
@@ -90,9 +109,34 @@ class JSONListFormatter(SequenceFormatter):
         """
         super().__init__('[', ']', ',')
 
+    def _joined(self, printer: Printer) -> bool:
+        return bool(getattr(printer, 'join_lists', False))
+
     def item_newline(self, printer: Printer, is_first: bool = False, is_last: bool = False):
-        if not hasattr(printer, 'join_lists') or not printer.join_lists:
+        """Separates two list items.
+
+        A joined list keeps all of its items on one line, separated by a single space so that the result reads as
+        ``[1, 2, 3]`` rather than ``[1,2,3]``.
+
+        """
+        if not self._joined(printer):
             printer.newline()
+        elif not is_first and not is_last:
+            printer.write(' ')
+
+    def items_indent(self, printer: Printer) -> Printer:
+        """Returns the printer context in which the list items are printed.
+
+        A joined list emits no newlines of its own, so indenting its items would have no visible effect on the list
+        itself while still adding a level of indentation to any nested sequence that *does* break across lines.
+
+        Returns:
+            Printer: :obj:`printer` itself if the list is joined, otherwise ``printer.indent()``.
+
+        """
+        if self._joined(printer):
+            return printer
+        return printer.indent()
 
     def print_ListNode(self, *args, **kwargs):
         """Prints a :class:`graphtage.ListNode`.
@@ -103,6 +147,8 @@ class JSONListFormatter(SequenceFormatter):
 
         """
         super().print_SequenceNode(*args, **kwargs)
+
+    print_UnorderedListNode = print_ListNode
 
     def print_SequenceNode(self, *args, **kwargs):
         """Prints a non-List sequence.
@@ -125,9 +171,34 @@ class JSONDictFormatter(SequenceFormatter):
     def __init__(self):
         super().__init__('{', '}', ',')
 
+    def _joined(self, printer: Printer) -> bool:
+        return bool(getattr(printer, 'join_dict_items', False))
+
     def item_newline(self, printer: Printer, is_first: bool = False, is_last: bool = False):
-        if not hasattr(printer, 'join_dict_items') or not printer.join_dict_items:
+        """Separates two dict items.
+
+        A joined dict keeps all of its items on one line, separated by a single space so that the result reads as
+        ``{"a": 1, "b": 2}`` rather than ``{"a": 1,"b": 2}``.
+
+        """
+        if not self._joined(printer):
             printer.newline()
+        elif not is_first and not is_last:
+            printer.write(' ')
+
+    def items_indent(self, printer: Printer) -> Printer:
+        """Returns the printer context in which the dict items are printed.
+
+        A joined dict emits no newlines of its own, so indenting its items would have no visible effect on the dict
+        itself while still adding a level of indentation to any nested sequence that *does* break across lines.
+
+        Returns:
+            Printer: :obj:`printer` itself if the dict is joined, otherwise ``printer.indent()``.
+
+        """
+        if self._joined(printer):
+            return printer
+        return printer.indent()
 
     def print_MultiSetNode(self, *args, **kwargs):
         """Prints a :class:`graphtage.MultiSetNode`.
@@ -198,7 +269,7 @@ class JSONStringFormatter(StringFormatter):
 
 class JSONFormatter(GraphtageFormatter):
     """The default JSON formatter."""
-    sub_format_types = [JSONStringFormatter, JSONListFormatter, JSONDictFormatter]
+    sub_format_types = (JSONStringFormatter, JSONListFormatter, JSONDictFormatter)
 
     def print_LeafNode(self, printer: Printer, node: LeafNode):
         """Prints a :class:`graphtage.LeafNode`.
@@ -229,7 +300,7 @@ class JSONFormatter(GraphtageFormatter):
 
         """
         # Treat the container like a list
-        list_node = ListNode((c.copy() for c in node.children()))
+        list_node = ListNode(c.copy() for c in node.children())
         self.print(printer, list_node)
 
 
@@ -251,11 +322,11 @@ class JSON(Filetype):
             'text/x-json'
         )
 
-    def build_tree(self, path: str, options: Optional[BuildOptions] = None) -> TreeNode:
+    def build_tree(self, path: str, options: BuildOptions | None = None) -> TreeNode:
         with open(path) as f:
             return build_tree(json.load(f), options)
 
-    def build_tree_handling_errors(self, path: str, options: Optional[BuildOptions] = None) -> Union[str, TreeNode]:
+    def build_tree_handling_errors(self, path: str, options: BuildOptions | None = None) -> str | TreeNode:
         try:
             return self.build_tree(path=path, options=options)
         except json.decoder.JSONDecodeError as de:
@@ -280,15 +351,15 @@ class JSON5(Filetype):
             'text/x-json5'
         )
 
-    def build_tree(self, path: str, options: Optional[BuildOptions] = None) -> TreeNode:
+    def build_tree(self, path: str, options: BuildOptions | None = None) -> TreeNode:
         with open(path) as f:
             return build_tree(json5.load(f), options)
 
-    def build_tree_handling_errors(self, path: str, options: Optional[BuildOptions] = None) -> Union[str, TreeNode]:
+    def build_tree_handling_errors(self, path: str, options: BuildOptions | None = None) -> str | TreeNode:
         try:
             return self.build_tree(path=path, options=options)
         except ValueError as ve:
-            return f'Error parsing {os.path.basename(path)}: {ve:!s}'
+            return f'Error parsing {os.path.basename(path)}: {ve!s}'
 
     def get_default_formatter(self) -> JSONFormatter:
         return JSONFormatter.DEFAULT_INSTANCE

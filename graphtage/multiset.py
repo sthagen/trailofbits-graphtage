@@ -5,15 +5,22 @@ This is used by :class:`graphtage.MultiSetNode` and :class:`graphtage.DictNode`,
 
 """
 
-from typing import Iterator, List
+import logging
+from collections.abc import Iterator
 
 import graphtage
+
 from .bounds import Range
 from .edits import Insert, Match, Remove
 from .matching import WeightedBipartiteMatcher
 from .sequences import SequenceEdit, SequenceNode
 from .tree import Edit, TreeNode
 from .utils import HashableCounter, largest
+
+log = logging.getLogger(__name__)
+
+MATCHING_SIZE_WARNING_THRESHOLD = 400
+"""The number of candidate pairs above which matching two unordered collections is reported as slow."""
 
 
 class MultiSetEdit(SequenceEdit):
@@ -24,7 +31,7 @@ class MultiSetEdit(SequenceEdit):
 
     """
 
-    __slots__ = ('_matched_kvp_edits', 'to_insert', 'to_remove', '_edits', '_matcher')
+    __slots__ = ('_edits', '_matched_kvp_edits', '_matcher', 'to_insert', 'to_remove')
 
     def __init__(
             self,
@@ -48,16 +55,16 @@ class MultiSetEdit(SequenceEdit):
                 this to `False` will require a significant amount more computation for larger dictionaries.
 
         """
-        self._matched_kvp_edits: List[Edit] = []
+        self._matched_kvp_edits: list[Edit] = []
         if auto_match_keys:
             to_set = HashableCounter(to_set)
             from_set = HashableCounter(from_set)
             to_remove_from = []
-            for f in from_set.keys():
+            for f in from_set:
                 if not isinstance(f, graphtage.KeyValuePairNode):
                     continue
-                for t in to_set.keys():
-                    if not isinstance(f, graphtage.KeyValuePairNode):
+                for t in to_set:
+                    if not isinstance(t, graphtage.KeyValuePairNode):
                         continue
                     if f.key == t.key:
                         num_matched = min(from_set[f], to_set[t])
@@ -75,7 +82,13 @@ class MultiSetEdit(SequenceEdit):
         self.to_remove = from_set - to_set
         """The set of nodes in :obj:`from_set` that do not exist in :obj:`to_set`."""
         to_match = from_set & to_set
-        self._edits: List[Edit] = [Match(n, n, 0) for n in to_match.elements()]
+        num_pairs = sum(self.to_remove.values()) * sum(self.to_insert.values())
+        if num_pairs > MATCHING_SIZE_WARNING_THRESHOLD:
+            log.warning(
+                "Matching %d unordered elements against %d requires costing %d pairs, which can take a long time",
+                sum(self.to_remove.values()), sum(self.to_insert.values()), num_pairs
+            )
+        self._edits: list[Edit] = [Match(n, n, 0) for n in to_match.elements()]
         self._matcher = WeightedBipartiteMatcher(
             from_nodes=self.to_remove.elements(),
             to_nodes=self.to_insert.elements(),
